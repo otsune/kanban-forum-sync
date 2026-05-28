@@ -1,8 +1,10 @@
-"""Kanban SQLite DB の読み取り・変更検出用モジュール。
+"""Kanban SQLite DB の読み取り・書き込みモジュール。
 実DBスキーマ（task_events ベースの変更検出）に合わせた実装。"""
 
 import sqlite3
 import os
+import json
+import time
 import logging
 from typing import Optional
 
@@ -10,9 +12,11 @@ logger = logging.getLogger(__name__)
 
 KANBAN_DB_PATH = os.path.expanduser("~/.hermes/kanban.db")
 
+TASK_COLS = "id, title, body, status, priority, assignee, created_at, completed_at"
+
 
 class KanbanBridge:
-    """Kanban DB への読み取り専用ブリッジ"""
+    """Kanban DB への読み書きブリッジ"""
 
     def __init__(self, db_path: str = KANBAN_DB_PATH):
         self.db_path = db_path
@@ -22,13 +26,14 @@ class KanbanBridge:
         conn.row_factory = sqlite3.Row
         return conn
 
+    # ---- 読み取り ----
+
     def get_all_tasks(self) -> list[dict]:
         """全タスクを取得（初期同期用）"""
         conn = self._connect()
         try:
             rows = conn.execute(
-                "SELECT id, title, body, status, priority, assignee, "
-                "created_at, completed_at FROM tasks"
+                f"SELECT {TASK_COLS} FROM tasks"
             ).fetchall()
             return [dict(r) for r in rows]
         finally:
@@ -40,13 +45,13 @@ class KanbanBridge:
         conn = self._connect()
         try:
             rows = conn.execute(
-                "SELECT DISTINCT t.id, t.title, t.body, t.status, t.priority, "
-                "t.assignee, t.created_at, t.completed_at "
+                "SELECT DISTINCT t.id, t.title, t.body, t.status, "
+                "t.priority, t.assignee, t.created_at, t.completed_at "
                 "FROM tasks t "
                 "JOIN task_events e ON t.id = e.task_id "
                 "WHERE e.id > ? "
                 "ORDER BY e.id ASC",
-                (last_event_id,)
+                (last_event_id,),
             ).fetchall()
             return [dict(r) for r in rows]
         finally:
@@ -57,9 +62,8 @@ class KanbanBridge:
         conn = self._connect()
         try:
             row = conn.execute(
-                "SELECT id, title, body, status, priority, assignee, "
-                "created_at, completed_at FROM tasks WHERE id = ?",
-                (task_id,)
+                f"SELECT {TASK_COLS} FROM tasks WHERE id = ?",
+                (task_id,),
             ).fetchone()
             return dict(row) if row else None
         finally:
@@ -74,29 +78,95 @@ class KanbanBridge:
         finally:
             conn.close()
 
-    def get_comments_since(self, task_id: str, event_id: int) -> list[dict]:
-        """タスクのコメントを取得（task_comments から）"""
+    def get_comments_since(self, task_id: str, last_id: int) -> list[dict]:
+        """タスクのコメントを取得"""
         conn = self._connect()
         try:
             rows = conn.execute(
                 "SELECT id, author, body, created_at FROM task_comments "
                 "WHERE task_id = ? AND id > ? ORDER BY id ASC",
-                (task_id, event_id)
+                (task_id, last_id),
             ).fetchall()
             return [dict(r) for r in rows]
         finally:
             conn.close()
 
-    def update_task_status(self, task_id: str, new_status: str) -> bool:
-        """タスクのステータスを更新（Phase 2 フィードバック用）"""
-        import time
+    # ---- 書き込み（Phase 2: フィードバック同期用） ----
+
+    def add_comment(self, task_id: str, author: str, body: str) -> bool:
+        """タスクにコメントを追加（コメント＋イベント）"""
         conn = self._connect()
         try:
+            now = int(time.time())
+            cursor = conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (task_id, author, body, now),
+            )
             conn.execute(
-                "UPDATE tasks SET status = ? WHERE id = ?",
-                (new_status, task_id)
+                "INSERT INTO task_events (task_id, kind, payload, created_at) "
+                "VALUES (?, 'commented', ?, ?)",
+                (task_id, json.dumps({"comment_id": cursor.lastrowid}), now),
             )
             conn.commit()
+            logger.info(f"Added comment to task-{task_id} by {author}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to add comment to task {task_id}: {e}")
+            return False
+        finally:
+            conn.close()
+
+    def record_event(self, task_id: str, kind: str,
+                     payload: Optional[str] = None) -> bool:
+        """タスクイベントを記録"""
+        conn = self._connect()
+        try:
+            now = int(time.time())
+            conn.execute(
+                "INSERT INTO task_events (task_id, kind, payload, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (task_id, kind, payload, now),
+            )
+            conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"Failed to record event for task {task_id}: {e}")
+            return False
+        finally:
+            conn.close()
+
+    def update_task_status(self, task_id: str, new_status: str) -> bool:
+        """タスクのステータスを更新し、イベントを記録"""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT status FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if not row:
+                logger.warning(f"Task {task_id} not found")
+                return False
+            old_status = row["status"]
+            if old_status == new_status:
+                return True
+
+            now = int(time.time())
+            conn.execute(
+                "UPDATE tasks SET status = ? WHERE id = ?",
+                (new_status, task_id),
+            )
+            payload = json.dumps({"from": old_status, "to": new_status,
+                                   "source": "forum_tag_sync"})
+            conn.execute(
+                "INSERT INTO task_events (task_id, kind, payload, created_at) "
+                "VALUES (?, 'status_change', ?, ?)",
+                (task_id, payload, now),
+            )
+            conn.commit()
+            logger.info(
+                f"Task-{task_id} status updated: "
+                f"{old_status} → {new_status} (from forum tag)"
+            )
             return True
         except Exception as e:
             logger.error(f"Failed to update task {task_id}: {e}")

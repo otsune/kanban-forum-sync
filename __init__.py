@@ -53,12 +53,14 @@ def cli_status(args):
     syncer = _get_syncer()
     state = syncer.get_state()
     ch = syncer.channel_id or "(auto)"
-    print(f"Syncer status: {state.state}")
+    print(f"Syncer state: {state.state}")
     print(f"Forum channel: {ch}")
     print(f"Monitored tasks: {state.task_count}")
     print(f"Last sync: {state.last_sync}")
     print(f"Last event ID: {state.last_event_id}")
     print(f"Errors: {state.error_count}")
+    print(f"Comments synced (Phase 2): {state.comment_count}")
+    print(f"Tag syncs (Phase 2): {state.tag_sync_count}")
     if state.last_error:
         print(f"Last error: {state.last_error}")
 

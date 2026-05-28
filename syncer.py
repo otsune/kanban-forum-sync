@@ -14,7 +14,7 @@ from .discord_forum import (
     FORUM_CHANNEL_TYPE,
 )
 from .kanban_bridge import KanbanBridge
-from .models import SyncState, SyncMap
+from .models import SyncState, SyncMap, ThreadMetaTracker
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +33,19 @@ STATUS_TO_TAG = {
 
 # Statuses that trigger thread archiving
 ARCHIVE_STATUSES = {"done", "archived"}
+
+# Reverse mapping: Discord tag name → kanban status (Phase 2: tag sync)
+TAG_TO_STATUS = {
+    "Triage": "triage",
+    "Backlog": "backlog",
+    "Todo": "todo",
+    "Scheduled": "scheduled",
+    "Ready": "ready",
+    "Running": "running",
+    "Blocked": "blocked",
+    "Review": "review",
+    "Done": "done",
+}
 
 # Discord tag emoji for each status
 STATUS_TAG_EMOJI = {
@@ -97,6 +110,12 @@ class KanbanForumSyncer:
 
         # {tag_name → tag_id}
         self._tag_map: dict[str, int] = {}
+
+        # Phase 2: per-thread metadata (last_message_id etc.)
+        self._thread_meta = ThreadMetaTracker()
+
+        # Bot 自身のユーザーID（コメントスキップ用）
+        self._bot_user_id: Optional[str] = None
 
     @property
     def channel_id(self) -> Optional[int]:
@@ -295,6 +314,135 @@ class KanbanForumSyncer:
             return [self._tag_map[tag_name]]
         return []
 
+    # ---- Phase 2: Forum → Kanban feedback sync ----
+
+    def _resolve_bot_user_id(self) -> Optional[str]:
+        """Bot 自身のユーザーIDを取得・キャッシュ（自分のメッセージをスキップするため）"""
+        if self._bot_user_id is None:
+            try:
+                user = self.discord._request("GET", "/users/@me")
+                self._bot_user_id = str(user["id"])
+                logger.info(f"Bot user ID: {self._bot_user_id}")
+            except Exception as e:
+                logger.warning(f"Failed to get bot user ID: {e}")
+        return self._bot_user_id
+
+    def _sync_forum_comments(self):
+        """Forum スレッドの新規メッセージを検出し、Kanban コメントとして追加する。
+        
+        各スレッドの最後に確認したメッセージID以降の新規メッセージを取得。
+        Bot 自身のメッセージはスキップ。"""
+        sync_items = self._sync_map.items()
+        if not sync_items:
+            return
+
+        bot_id = self._resolve_bot_user_id()
+        new_comments = 0
+
+        for task_id, thread_id in sync_items.items():
+            last_id = self._thread_meta.get_last_message_id(thread_id)
+            after_param = last_id if last_id > 0 else None
+
+            try:
+                messages = self.discord.get_thread_messages(
+                    thread_id, after=after_param, limit=50
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to fetch messages for thread {thread_id}: {e}"
+                )
+                continue
+
+            if not messages:
+                continue
+
+            # Discord は新しい順に返す → 古い順に並べ替え
+            messages.reverse()
+
+            for msg in messages:
+                msg_id = int(msg["id"])
+                author = msg["author"]
+                author_id = str(author.get("id", ""))
+                author_name = author.get("username", "unknown")
+                is_bot = author.get("bot", False)
+
+                # Bot 自身のメッセージはスキップ
+                if is_bot or (bot_id and author_id == bot_id):
+                    self._thread_meta.set_last_message_id(thread_id, msg_id)
+                    continue
+
+                content = msg.get("content", "").strip()
+                if content:
+                    if self.kanban.add_comment(task_id, author_name, content):
+                        new_comments += 1
+                        logger.debug(
+                            f"Comment synced: {author_name} → task-{task_id}"
+                        )
+
+                # 各メッセージ処理後に ID を更新（再同期防止）
+                self._thread_meta.set_last_message_id(thread_id, msg_id)
+
+            time.sleep(0.5)  # レート制限
+
+        if new_comments:
+            self._state.comment_count += new_comments
+            logger.info(f"Synced {new_comments} new comment(s) from forum")
+
+    def _sync_forum_tags(self):
+        """Forum スレッドのタグ変更を検出し、Kanban ステータスに反映する。
+        
+        各スレッドの applied_tags を取得し、タグ名→ステータスのマッピングで
+        Kanban DB の status を更新。自分自身の更新によるタグ変更はスキップするため、
+        無限ループにはならない。"""
+        sync_items = self._sync_map.items()
+        if not sync_items:
+            return
+
+        changed = 0
+        for task_id, thread_id in sync_items.items():
+            try:
+                thread = self.discord.get_channel_by_id(thread_id)
+            except Exception as e:
+                logger.warning(
+                    f"Failed to fetch thread {thread_id}: {e}"
+                )
+                continue
+
+            applied = thread.get("applied_tags", [])
+            if not isinstance(applied, list):
+                continue
+
+            # applied_tags は ID のリスト → 逆引きマップでステータス名に
+            new_status = None
+            for tag_id in applied:
+                # 逆引き: tag_id → tag_name → status
+                tag_name = None
+                for name, tid in self._tag_map.items():
+                    if tid == tag_id:
+                        tag_name = name
+                        break
+                if tag_name and tag_name in TAG_TO_STATUS:
+                    new_status = TAG_TO_STATUS[tag_name]
+                    break
+
+            if new_status:
+                current = self.kanban.get_task(task_id)
+                if current and current["status"] != new_status:
+                    if self.kanban.update_task_status(task_id, new_status):
+                        changed += 1
+                        logger.info(
+                            f"Tag sync: task-{task_id} "
+                            f"{current['status']} → {new_status}"
+                        )
+
+            time.sleep(0.5)
+
+        if changed:
+            self._state.tag_sync_count += changed
+            logger.info(
+                f"Tag sync: {changed} task(s) status updated from forum tags"
+            )
+
     # ---- Thread content generation ----
 
     def _thread_title(self, task: dict) -> str:
@@ -392,7 +540,11 @@ class KanbanForumSyncer:
         )
 
     def incremental_sync(self):
-        """増分同期（1回のポーリング）"""
+        """増分同期（1回のポーリング）
+
+        Phase 1: Kanban DB の変更を検出 → Forum に反映
+        Phase 2: Forum の変更を検出 → Kanban にフィードバック"""
+        # Phase 1: Kanban → Forum
         last_id = self._state.last_event_id
         changed = self.kanban.get_tasks_changed_since_event(last_id)
 
@@ -410,6 +562,10 @@ class KanbanForumSyncer:
         if latest_event > self._state.last_event_id:
             self._state.last_event_id = latest_event
             logger.debug(f"Updated last_event_id to {latest_event}")
+
+        # Phase 2: Forum → Kanban feedback
+        self._sync_forum_comments()
+        self._sync_forum_tags()
 
     # ---- Thread lifecycle ----
 
