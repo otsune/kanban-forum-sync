@@ -2,6 +2,8 @@
 Bot Token 認証で Forum スレッドを作成・更新・アーカイブする。"""
 
 import json
+import os
+import ssl
 import time
 import logging
 from urllib.request import Request, urlopen
@@ -13,6 +15,13 @@ BASE_URL = "https://discord.com/api/v10"
 FORUM_CHANNEL_TYPE = 15
 
 logger = logging.getLogger(__name__)
+
+# Homebrew Python は独自の OpenSSL を使うため CA バンドルが不完全な場合がある。
+# システムの CA ファイルが存在すれば明示的に使用する。
+_SYSTEM_CA = "/etc/ssl/certs/ca-certificates.crt"
+_SSL_CONTEXT: ssl.SSLContext | None = None
+if os.path.exists(_SYSTEM_CA):
+    _SSL_CONTEXT = ssl.create_default_context(cafile=_SYSTEM_CA)
 
 
 class DiscordForumError(RuntimeError):
@@ -54,7 +63,7 @@ class DiscordForumClient:
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                with urlopen(req) as resp:
+                with urlopen(req, timeout=30, context=_SSL_CONTEXT) as resp:
                     raw = resp.read().decode()
                     if not raw:
                         return {}
