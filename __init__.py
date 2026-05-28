@@ -16,9 +16,11 @@ _syncer_instance = None
 def _get_syncer():
     global _syncer_instance
     if _syncer_instance is None:
+        channel_id_str = os.environ.get("FORUM_SYNC_CHANNEL_ID", "").strip()
+        channel_id = int(channel_id_str) if channel_id_str else None
         _syncer_instance = KanbanForumSyncer(
             bot_token=os.environ["FORUM_SYNC_BOT_TOKEN"],
-            channel_id=int(os.environ["FORUM_SYNC_CHANNEL_ID"]),
+            channel_id=channel_id,
             poll_interval=int(os.environ.get("FORUM_SYNC_POLL_INTERVAL", "15")),
         )
     return _syncer_instance
@@ -50,7 +52,9 @@ def cli_setup(subparsers):
 def cli_status(args):
     syncer = _get_syncer()
     state = syncer.get_state()
+    ch = syncer.channel_id or "(auto)"
     print(f"Syncer status: {state.state}")
+    print(f"Forum channel: {ch}")
     print(f"Monitored tasks: {state.task_count}")
     print(f"Last sync: {state.last_sync}")
     print(f"Last event ID: {state.last_event_id}")

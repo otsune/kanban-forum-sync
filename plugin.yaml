@@ -7,7 +7,10 @@ requires_env:
     description: Discord Bot Token (from Discord Developer Portal)
     secret: true
   - name: FORUM_SYNC_CHANNEL_ID
-    description: Discord Forum Channel ID (snowflake)
+    description: >-
+      Discord Forum Channel ID (snowflake).
+      Optional: if unset or empty, bot will auto-discover or create a forum named
+      'kanban' / 'task-board' in the first accessible guild.
   - name: FORUM_SYNC_POLL_INTERVAL
     description: "Polling interval in seconds (default: 15)"
     default: "15"

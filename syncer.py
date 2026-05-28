@@ -6,7 +6,13 @@ import logging
 from threading import Thread, Event
 from typing import Optional
 
-from .discord_forum import DiscordForumClient
+from .discord_forum import (
+    DiscordForumClient,
+    DiscordForumError,
+    PermissionError,
+    NotFoundError,
+    FORUM_CHANNEL_TYPE,
+)
 from .kanban_bridge import KanbanBridge
 from .models import SyncState, SyncMap
 
@@ -46,24 +52,45 @@ def _make_tag_dict(name: str) -> dict:
     tag = {"name": name, "moderated": False}
     emoji = STATUS_TAG_EMOJI.get(name)
     if emoji:
-        # Use unicode emoji
         tag["emoji_name"] = emoji
     return tag
 
 
 REQUIRED_TAGS = [_make_tag_dict(n) for n in STATUS_TAG_EMOJI]
 
+ADMIN_GUIDE_MESSAGE = """
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+⚠️  Discord Forum チャンネルが存在しません
+
+Bot にチャンネル作成権限がないため、自動生成できませんでした。
+以下の手順でサーバー管理者に依頼してください：
+
+1. Discord サーバー設定を開く
+2. 「チャンネル」→「チャンネルを作成」を選択
+3. チャンネルタイプ: 「フォーラム」
+4. 名前: 「kanban」（または task-board）
+5. 作成後、チャンネルIDを以下の環境変数に設定:
+   FORUM_SYNC_CHANNEL_ID=<チャンネルID>
+
+または、Bot に「チャンネルを管理」権限を付与すれば自動生成されます。
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""
+
 
 class KanbanForumSyncer:
     """Kanban ↔ Discord Forum 同期エンジン"""
 
-    def __init__(self, bot_token: str, channel_id: int, poll_interval: int = 15):
-        self.discord = DiscordForumClient(bot_token, channel_id)
-        self.kanban = KanbanBridge()
+    def __init__(self, bot_token: str, channel_id: Optional[int] = None,
+                 poll_interval: int = 15):
+        self.bot_token = bot_token
+        self._channel_id = channel_id
         self.poll_interval = poll_interval
         self._thread: Optional[Thread] = None
         self._stop_event = Event()
         self._state = SyncState()
+
+        self.discord = DiscordForumClient(bot_token, self._channel_id)
+        self.kanban = KanbanBridge()
 
         # {kanban_task_id → discord_thread_id}
         self._sync_map = SyncMap()
@@ -71,8 +98,167 @@ class KanbanForumSyncer:
         # {tag_name → tag_id}
         self._tag_map: dict[str, int] = {}
 
+    @property
+    def channel_id(self) -> Optional[int]:
+        return self._channel_id
+
     def get_state(self) -> SyncState:
         return self._state
+
+    # ---- Forum channel auto-resolution ----
+
+    def _resolve_forum_channel(self) -> bool:
+        """Forum チャンネルを解決する。
+        1. channel_id が設定されていて Forum なら OK
+        2. channel_id 未設定 → Bot の参加全サーバーを探索
+        3. 非Forumチャンネル指定 → 同サーバー内を検索/作成
+        4. 見つからない/作成不可 → 管理者向け案内表示して False
+
+        Returns: True=解決成功, False=解決失敗
+        """
+        FORUM_GUIDE_URL = "https://support.discord.com/hc/ja/articles/6208479917079"
+
+        guild_id = None
+
+        # --- 1. channel_id が設定されている場合 ---
+        if self._channel_id is not None:
+            try:
+                channel = self.discord.get_channel()
+                if channel.get("type") == FORUM_CHANNEL_TYPE:
+                    logger.info(
+                        f"Channel #{channel['name']} "
+                        f"({self._channel_id}) is a valid forum"
+                    )
+                    return True
+                # 存在するがForumではない → 同サーバー内検索へ
+                guild_id = int(channel["guild_id"])
+                logger.info(
+                    f"Channel #{channel['name']} is type="
+                    f"{channel.get('type')} (not forum). "
+                    f"Searching guild {guild_id}..."
+                )
+            except (NotFoundError, DiscordForumError) as e:
+                logger.warning(
+                    f"Configured channel {self._channel_id} "
+                    f"not accessible: {e}"
+                )
+                self._state.last_error = (
+                    f"Channel ID {self._channel_id} is not accessible.\n"
+                    "Please check the channel ID or leave it unset "
+                    "for auto-discovery.\n"
+                    f"作成ガイド: {FORUM_GUIDE_URL}"
+                )
+                print(ADMIN_GUIDE_MESSAGE)
+                return False
+
+        # --- 2. guild_id が不明（channel_id 未設定 or 検出失敗） ---
+        if guild_id is None:
+            logger.info("No channel_id set. Scanning bot's guilds...")
+            try:
+                guilds = self.discord.get_bot_guilds()
+            except DiscordForumError as e:
+                self._state.last_error = (
+                    f"Cannot list guilds: {e}\n"
+                    "Bot may lack 'guilds' OAuth2 scope.\n"
+                    "Set FORUM_SYNC_CHANNEL_ID explicitly."
+                )
+                print(ADMIN_GUIDE_MESSAGE)
+                return False
+
+            # 全サーバーの Forum を検索
+            for g in guilds:
+                gid = int(g["id"])
+                existing = self.discord.find_forum_channel(gid)
+                if existing:
+                    new_id = int(existing["id"])
+                    logger.info(
+                        f"Found forum #{existing['name']} ({new_id}) "
+                        f"in guild '{g['name']}' ({gid})"
+                    )
+                    self._channel_id = new_id
+                    self.discord.channel_id = new_id
+                    return True
+
+            # 全サーバーに Forum なし → 作成試行
+            if guilds:
+                first = guilds[0]
+                gid = int(first["id"])
+                logger.info(
+                    f"No forum found. Attempting to create "
+                    f"in '{first['name']}' ({gid})..."
+                )
+                try:
+                    created = self.discord.create_forum_channel(
+                        gid, name="kanban"
+                    )
+                    new_id = int(created["id"])
+                    logger.info(f"Created forum #kanban ({new_id})")
+                    self._channel_id = new_id
+                    self.discord.channel_id = new_id
+                    return True
+                except PermissionError:
+                    self._state.last_error = (
+                        "Bot lacks 'Manage Channels' permission.\n"
+                        f"作成ガイド: {FORUM_GUIDE_URL}\n\n"
+                        "Ask a server admin to:\n"
+                        "1. Create a forum channel named 'kanban'\n"
+                        "2. Grant 'Manage Channels' to the bot\n"
+                        "3. Or set FORUM_SYNC_CHANNEL_ID explicitly"
+                    )
+                    print(ADMIN_GUIDE_MESSAGE)
+                    return False
+                except DiscordForumError as e:
+                    self._state.last_error = (
+                        f"Failed to create forum: {e}"
+                    )
+                    print(ADMIN_GUIDE_MESSAGE)
+                    return False
+
+            # Bot がどのサーバーにも参加していない
+            self._state.last_error = (
+                "Bot is not in any guild. "
+                "Invite the bot to a server first.\n"
+                f"作成ガイド: {FORUM_GUIDE_URL}"
+            )
+            print(ADMIN_GUIDE_MESSAGE)
+            return False
+
+        # --- 3. guild_id 確定済み：同サーバー内で検索/作成 ---
+        existing = self.discord.find_forum_channel(guild_id)
+        if existing:
+            new_id = int(existing["id"])
+            logger.info(
+                f"Switching to forum #{existing['name']} ({new_id})"
+            )
+            self._channel_id = new_id
+            self.discord.channel_id = new_id
+            return True
+
+        # 同サーバーに Forum なし → 作成試行
+        try:
+            created = self.discord.create_forum_channel(
+                guild_id, name="kanban"
+            )
+            new_id = int(created["id"])
+            logger.info(f"Created forum #kanban ({new_id})")
+            self._channel_id = new_id
+            self.discord.channel_id = new_id
+            return True
+        except PermissionError:
+            self._state.last_error = (
+                "Bot lacks 'Manage Channels' permission.\n"
+                f"作成ガイド: {FORUM_GUIDE_URL}\n\n"
+                "Ask a server admin to:\n"
+                "1. Create a forum channel named 'kanban'\n"
+                "2. Grant 'Manage Channels' to the bot\n"
+                "3. Or set FORUM_SYNC_CHANNEL_ID explicitly"
+            )
+            print(ADMIN_GUIDE_MESSAGE)
+            return False
+        except DiscordForumError as e:
+            self._state.last_error = f"Failed to create forum: {e}"
+            print(ADMIN_GUIDE_MESSAGE)
+            return False
 
     # ---- Tag management ----
 
@@ -80,7 +266,10 @@ class KanbanForumSyncer:
         """Forum のタグ一覧を取得し、{tag_name → tag_id} マップを構築"""
         tags = self.discord.get_tags()
         self._tag_map = {t["name"]: t["id"] for t in tags}
-        logger.info(f"Tag map built with {len(self._tag_map)} tags: {list(self._tag_map.keys())}")
+        logger.info(
+            f"Tag map built with {len(self._tag_map)} tags: "
+            f"{list(self._tag_map.keys())}"
+        )
 
     def _ensure_tags(self):
         """必要な Forum タグが存在するか確認し、不足があれば作成する"""
@@ -89,7 +278,10 @@ class KanbanForumSyncer:
         missing = [t for t in REQUIRED_TAGS if t["name"] not in existing_names]
 
         if missing:
-            logger.info(f"Creating {len(missing)} missing tags: {[t['name'] for t in missing]}")
+            logger.info(
+                f"Creating {len(missing)} missing tags: "
+                f"{[t['name'] for t in missing]}"
+            )
             new_tags = tags + missing
             self.discord.create_tags(new_tags)
             time.sleep(1)  # API反映待ち
@@ -245,6 +437,12 @@ class KanbanForumSyncer:
 
     def _run_loop(self):
         """ポーリングループ本体"""
+        # 起動時に Forum チャンネルを解決
+        if not self._resolve_forum_channel():
+            self._state.state = "error"
+            logger.error("Forum channel resolution failed. Sync aborted.")
+            return
+
         try:
             self.initial_sync()
         except Exception as e:
@@ -263,6 +461,9 @@ class KanbanForumSyncer:
 
     def full_sync(self):
         """手動フル同期（CLI/スラッシュコマンド用）"""
+        # チャンネル解決もやり直す
+        if not self._resolve_forum_channel():
+            return
         self._ensure_tags()
         self._build_tag_map()
         # 既存の同期マップをクリアして再同期
