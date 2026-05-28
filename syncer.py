@@ -1,6 +1,7 @@
 """Kanban ↔ Discord Forum 同期のコアロジック。
 task_events ベースの変更検出でポーリング。"""
 
+import os
 import time
 import logging
 from threading import Thread, Event
@@ -18,59 +19,68 @@ from .models import SyncState, SyncMap, ThreadMetaTracker
 
 logger = logging.getLogger(__name__)
 
-# Kanban status → Discord tag name mapping
-STATUS_TO_TAG = {
-    "triage": "Triage",
-    "todo": "Todo",
-    "scheduled": "Scheduled",
-    "ready": "Ready",
-    "running": "Running",
-    "blocked": "Blocked",
-    "review": "Review",
-    "done": "Done",
-    "archived": "Done",
+# ---- i18n: tag name locale data ----
+# (status, en_name, ja_name, emoji)
+_LOCALE_DATA = [
+    ("triage",    "Triage",    "トリアージ", "🩺"),
+    ("todo",      "Todo",      "未着手",     "📝"),
+    ("scheduled", "Scheduled", "予定済み",   "📅"),
+    ("ready",     "Ready",     "着手可能",   "✅"),
+    ("running",   "Running",   "進行中",     "🔄"),
+    ("blocked",   "Blocked",   "停滞中",     "🚧"),
+    ("review",    "Review",    "レビュー中", "👀"),
+    ("done",      "Done",      "完了",       "🎉"),
+]
+
+# Phase 2 専用タグ（Kanban ステータスには存在しない）
+_EXTRA_TAGS: dict[str, dict[str, str]] = {
+    "en": {"Backlog": "backlog"},
+    "ja": {"バックログ": "backlog"},
 }
 
-# Statuses that trigger thread archiving
+_SUPPORTED_LANGS = ("en", "ja")
+
+
+def _build_tag_tables(lang: str) -> tuple[dict, dict, dict]:
+    """言語設定から STATUS_TO_TAG / TAG_TO_STATUS / STATUS_TAG_EMOJI を生成する。"""
+    use_ja = lang == "ja"
+    status_to_tag: dict[str, str] = {}
+    tag_to_status: dict[str, str] = {}
+    status_tag_emoji: dict[str, str] = {}
+
+    for status, en, ja, emoji in _LOCALE_DATA:
+        tag = ja if use_ja else en
+        status_to_tag[status] = tag
+        tag_to_status[tag] = status
+        status_tag_emoji[tag] = emoji
+
+    status_to_tag["archived"] = status_to_tag["done"]
+    tag_to_status.update(_EXTRA_TAGS.get(lang, _EXTRA_TAGS["en"]))
+
+    return status_to_tag, tag_to_status, status_tag_emoji
+
+
+_LANG = os.environ.get("FORUM_SYNC_LANG", "en").strip().lower()
+if _LANG not in _SUPPORTED_LANGS:
+    logger.warning("Unsupported FORUM_SYNC_LANG=%r; falling back to 'en'", _LANG)
+    _LANG = "en"
+
+STATUS_TO_TAG, TAG_TO_STATUS, STATUS_TAG_EMOJI = _build_tag_tables(_LANG)
+
+# Statuses that trigger thread archiving (locale-independent)
 ARCHIVE_STATUSES = {"done", "archived"}
-
-# Reverse mapping: Discord tag name → kanban status (Phase 2: tag sync)
-TAG_TO_STATUS = {
-    "Triage": "triage",
-    "Backlog": "backlog",
-    "Todo": "todo",
-    "Scheduled": "scheduled",
-    "Ready": "ready",
-    "Running": "running",
-    "Blocked": "blocked",
-    "Review": "review",
-    "Done": "done",
-}
-
-# Discord tag emoji for each status
-STATUS_TAG_EMOJI = {
-    "Triage": "🩺",
-    "Todo": "📝",
-    "Scheduled": "📅",
-    "Ready": "✅",
-    "Running": "🔄",
-    "Blocked": "🚧",
-    "Review": "👀",
-    "Done": "🎉",
-}
 
 _FORUM_GUIDE_URL = "https://support.discord.com/hc/ja/articles/6208479917079"
 
 
-def _make_tag_dict(name: str) -> dict:
-    tag = {"name": name, "moderated": False}
-    emoji = STATUS_TAG_EMOJI.get(name)
+def _make_tag_dict(name: str, emoji: str = "") -> dict:
+    tag: dict = {"name": name, "moderated": False}
     if emoji:
         tag["emoji_name"] = emoji
     return tag
 
 
-REQUIRED_TAGS = [_make_tag_dict(n) for n in STATUS_TAG_EMOJI]
+REQUIRED_TAGS = [_make_tag_dict(name, emoji) for name, emoji in STATUS_TAG_EMOJI.items()]
 
 ADMIN_GUIDE_MESSAGE = """
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

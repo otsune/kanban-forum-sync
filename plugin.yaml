@@ -16,6 +16,12 @@ requires_env:
   - name: FORUM_SYNC_POLL_INTERVAL
     description: "Polling interval in seconds (default: 15)"
     default: "15"
+  - name: FORUM_SYNC_LANG
+    description: >-
+      Discord Forum タグの言語設定。"en"（デフォルト）または "ja"。
+      "ja" にすると Forum タグ名が日本語になる（例: Running → 進行中）。
+      既存の英語タグがある場合は Discord 側で手動削除が必要。
+    default: "en"
   - name: FORUM_SYNC_EVENT_DRIVEN
     description: >-
       Set to 1 to enable inotify-based event-driven sync (Linux only).

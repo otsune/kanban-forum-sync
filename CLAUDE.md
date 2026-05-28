@@ -50,6 +50,7 @@ Discord Developer Portal でボットに付与が必要な権限:
 | `FORUM_SYNC_BOT_TOKEN` | Yes (or `DISCORD_BOT_TOKEN`) | Discord Bot token |
 | `FORUM_SYNC_CHANNEL_ID` | No | Forum channel snowflake; auto-discovered if unset |
 | `FORUM_SYNC_POLL_INTERVAL` | No | Polling interval in seconds (default: 15) |
+| `FORUM_SYNC_LANG` | No | Forum タグの言語。`en`（デフォルト）または `ja` |
 | `FORUM_SYNC_EVENT_DRIVEN` | No | Set to `1` to enable inotify-based event-driven sync (Linux only, default: 0) |
 
 ## Architecture
@@ -92,7 +93,7 @@ Both JSON files live inside the plugin directory:
 
 ### Status ↔ tag mapping
 
-`STATUS_TO_TAG` (in `syncer.py`) maps Kanban statuses to Discord tag names. `TAG_TO_STATUS` is the reverse for Phase 2. Both `"done"` and `"archived"` map to the `"Done"` tag; archiving sets `archived=True` on the thread. Required tags are auto-created on startup via `_ensure_tags()`.
+`STATUS_TO_TAG` / `TAG_TO_STATUS` / `STATUS_TAG_EMOJI` / `REQUIRED_TAGS` は `_build_tag_tables(lang)` から生成される（`syncer.py` モジュール読み込み時に `FORUM_SYNC_LANG` を参照）。`"done"` と `"archived"` は同じタグにマップされ、アーカイブ時に `archived=True` をセットする。必要なタグは起動時に `_ensure_tags()` で自動作成。言語切り替え時は Discord 側の古いタグを手動削除する必要がある（タグIDが変わるため）。
 
 ### Relationship to `kanban_notify_subs`
 
