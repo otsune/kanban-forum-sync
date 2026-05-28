@@ -1,7 +1,5 @@
-"""
-Discord Forum Channel REST API 操作モジュール。
-Bot Token 認証で Forum スレッドを作成・更新・アーカイブする。
-"""
+"""Discord Forum Channel REST API 操作モジュール。
+Bot Token 認証で Forum スレッドを作成・更新・アーカイブする。"""
 
 import json
 import time
@@ -31,48 +29,73 @@ class DiscordForumClient:
         url = f"{BASE_URL}{path}"
         data = json.dumps(body).encode() if body else None
         req = Request(url, data=data, headers=self._headers, method=method)
-        try:
-            with urlopen(req) as resp:
-                return json.loads(resp.read().decode())
-        except HTTPError as e:
-            if e.code == 429:  # Rate limited
-                retry_after = json.loads(e.read().decode()).get("retry_after", 1)
-                logger.warning(f"Rate limited, retrying in {retry_after}s")
-                time.sleep(retry_after)
-                return self._request(method, path, body)
-            logger.error(f"Discord API error {e.code}: {e.read().decode()}")
-            raise
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                with urlopen(req) as resp:
+                    return json.loads(resp.read().decode())
+            except HTTPError as e:
+                if e.code == 429:
+                    retry_info = json.loads(e.read().decode())
+                    retry_after = retry_info.get("retry_after", 1)
+                    logger.warning(
+                        f"Rate limited (attempt {attempt+1}/{max_retries}), "
+                        f"retrying in {retry_after}s"
+                    )
+                    time.sleep(retry_after)
+                    continue
+                error_body = e.read().decode()
+                logger.error(f"Discord API error {e.code}: {error_body}")
+                raise
+        raise RuntimeError(f"Request failed after {max_retries} retries: {path}")
+
+    # ---- Channel-level operations ----
+
+    def get_channel(self) -> dict:
+        """Forum チャンネルの情報を取得"""
+        return self._request("GET", f"/channels/{self.channel_id}")
 
     def get_tags(self) -> list[dict]:
         """Forum チャンネルのタグ一覧を取得"""
-        channel = self._request("GET", f"/channels/{self.channel_id}")
+        channel = self.get_channel()
         return channel.get("available_tags", [])
 
-    def create_thread(self, name: str, content: str, tag_ids: list[int]) -> dict:
+    def create_tags(self, tags: list[dict]) -> list[dict]:
+        """Forum チャンネルのタグを一括設定。
+        tags: [{"name": str, "moderated": bool, "emoji_name": Optional[str]}, ...]
+        Discord API は available_tags 全体を置き換える PATCH が必要。"""
+        channel = self._request(
+            "PATCH", f"/channels/{self.channel_id}",
+            {"available_tags": tags}
+        )
+        return channel.get("available_tags", [])
+
+    # ---- Thread operations ----
+
+    def create_thread(self, name: str, content: str,
+                      applied_tags: list[int]) -> dict:
         """Forum にスレッドを作成"""
         return self._request("POST", f"/channels/{self.channel_id}/threads", {
             "name": name,
             "message": {"content": content},
-            "applied_tags": tag_ids,
+            "applied_tags": applied_tags,
         })
 
-    def update_thread(self, thread_id: int, name: str = None,
-                      tag_ids: list[int] = None,
-                      archived: bool = None, locked: bool = None) -> dict:
-        """スレッドのプロパティを更新"""
-        body = {}
-        if name is not None:
-            body["name"] = name
-        if tag_ids is not None:
-            body["applied_tags"] = tag_ids
-        if archived is not None:
-            body["archived"] = archived
-            body["locked"] = locked if locked is not None else False
-        return self._request("PATCH", f"/channels/{thread_id}", body)
+    def update_thread(self, thread_id: int, **kwargs) -> dict:
+        """スレッドのプロパティを更新。
+        有効なキーワード: name, archived, locked, applied_tags, rate_limit_per_user
+        Discord API: PATCH /channels/{thread_id}"""
+        if not kwargs:
+            return {}
+        return self._request("PATCH", f"/channels/{thread_id}", kwargs)
 
     def archive_thread(self, thread_id: int) -> dict:
         """スレッドをアーカイブ"""
-        return self.update_thread(thread_id, archived=True)
+        return self.update_thread(thread_id, archived=True, locked=False)
+
+    def delete_thread(self, thread_id: int) -> dict:
+        """スレッドを削除"""
+        return self._request("DELETE", f"/channels/{thread_id}")
 
     def send_message(self, thread_id: int, content: str) -> dict:
         """スレッドにメッセージを投稿"""

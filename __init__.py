@@ -49,11 +49,14 @@ def cli_setup(subparsers):
 
 def cli_status(args):
     syncer = _get_syncer()
-    status = syncer.get_status()
-    print(f"Syncer status: {status.state}")
-    print(f"Monitored tasks: {status.task_count}")
-    print(f"Last sync: {status.last_sync}")
-    print(f"Errors: {status.error_count}")
+    state = syncer.get_state()
+    print(f"Syncer status: {state.state}")
+    print(f"Monitored tasks: {state.task_count}")
+    print(f"Last sync: {state.last_sync}")
+    print(f"Last event ID: {state.last_event_id}")
+    print(f"Errors: {state.error_count}")
+    if state.last_error:
+        print(f"Last error: {state.last_error}")
 
 
 def cli_start(args):
