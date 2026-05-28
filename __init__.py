@@ -38,24 +38,22 @@ def _get_syncer():
 # ---- CLI サブコマンド ----
 
 
-def cli_setup(subparsers):
-    parser = subparsers.add_parser(
-        "kanban-forum-sync",
-        help="Kanban ↔ Discord Forum 同期の管理",
-    )
+def cli_setup(parser):
     sub = parser.add_subparsers(dest="kanban_forum_command")
 
     p_status = sub.add_parser("status", help="同期状態を表示")
-    p_status.set_defaults(handler=cli_status)
+    p_status.set_defaults(func=cli_status)
 
     p_start = sub.add_parser("start", help="同期 watcher を開始")
-    p_start.set_defaults(handler=cli_start)
+    p_start.set_defaults(func=cli_start)
 
     p_stop = sub.add_parser("stop", help="同期 watcher を停止")
-    p_stop.set_defaults(handler=cli_stop)
+    p_stop.set_defaults(func=cli_stop)
 
     p_sync = sub.add_parser("sync", help="フル同期を即時実行")
-    p_sync.set_defaults(handler=cli_sync)
+    p_sync.set_defaults(func=cli_sync)
+
+    parser.set_defaults(func=lambda args: parser.print_help())
 
 
 def cli_status(args):
