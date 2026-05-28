@@ -4,7 +4,9 @@ description: Sync Hermes Kanban tasks to Discord Forum channels
 author: otsune
 requires_env:
   - name: FORUM_SYNC_BOT_TOKEN
-    description: Discord Bot Token (from Discord Developer Portal)
+    description: >-
+      Discord Bot Token (from Discord Developer Portal).
+      未設定の場合は DISCORD_BOT_TOKEN をフォールバックとして使用。
     secret: true
   - name: FORUM_SYNC_CHANNEL_ID
     description: >-

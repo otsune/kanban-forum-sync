@@ -18,8 +18,15 @@ def _get_syncer():
     if _syncer_instance is None:
         channel_id_str = os.environ.get("FORUM_SYNC_CHANNEL_ID", "").strip()
         channel_id = int(channel_id_str) if channel_id_str else None
+        bot_token = os.environ.get("FORUM_SYNC_BOT_TOKEN")
+        if not bot_token:
+            bot_token = os.environ.get("DISCORD_BOT_TOKEN")
+            if not bot_token:
+                raise RuntimeError(
+                    "FORUM_SYNC_BOT_TOKEN も DISCORD_BOT_TOKEN も設定されていません"
+                )
         _syncer_instance = KanbanForumSyncer(
-            bot_token=os.environ["FORUM_SYNC_BOT_TOKEN"],
+            bot_token=bot_token,
             channel_id=channel_id,
             poll_interval=int(os.environ.get("FORUM_SYNC_POLL_INTERVAL", "15")),
         )
@@ -83,19 +90,18 @@ def cli_sync(args):
     print("Full sync complete.")
 
 
-# ---- 起動フック ----
-
-
-def _on_post_plugin_init(ctx):
-    """Hermes 起動時に自動で watcher を開始"""
-    syncer = _get_syncer()
-    syncer.start()
-    logger.info("Kanban ↔ Discord Forum sync watcher started.")
-
-
 # ---- 登録 ----
 
 
 def register(ctx):
-    ctx.register_hook("post_plugin_init", _on_post_plugin_init)
-    ctx.register_cli_command("kanban-forum-sync", setup_fn=cli_setup)
+    ctx.register_cli_command(
+        "kanban-forum-sync",
+        "Kanban ↔ Discord Forum sync management",
+        setup_fn=cli_setup,
+    )
+    try:
+        syncer = _get_syncer()
+        syncer.start()
+        logger.info("Kanban ↔ Discord Forum sync watcher started.")
+    except Exception as e:
+        logger.warning("kanban-forum-sync: watcher not started: %s", e)
