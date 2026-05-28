@@ -91,6 +91,29 @@ class KanbanBridge:
         finally:
             conn.close()
 
+    def get_events_since(self, task_id: str, last_id: int,
+                         kinds: list[str] = None) -> list[dict]:
+        """タスクのイベントを取得（ワーカーログ用）"""
+        conn = self._connect()
+        try:
+            if kinds:
+                placeholders = ",".join("?" * len(kinds))
+                rows = conn.execute(
+                    f"SELECT id, kind, payload, created_at FROM task_events "
+                    f"WHERE task_id = ? AND id > ? AND kind IN ({placeholders}) "
+                    f"ORDER BY id ASC",
+                    (task_id, last_id, *kinds),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT id, kind, payload, created_at FROM task_events "
+                    "WHERE task_id = ? AND id > ? ORDER BY id ASC",
+                    (task_id, last_id),
+                ).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
     # ---- 書き込み（Phase 2: フィードバック同期用） ----
 
     def add_comment(self, task_id: str, author: str, body: str) -> bool:

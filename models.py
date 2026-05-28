@@ -114,6 +114,32 @@ class ThreadMetaTracker:
             self._data.pop(str(thread_id), None)
             self._save()
 
+    def get_last_comment_id(self, thread_id: int) -> int:
+        """Kanban→Discord で最後に投稿したコメントID"""
+        with self._lock:
+            return self._data.get(str(thread_id), {}).get("last_comment_id", 0)
+
+    def set_last_comment_id(self, thread_id: int, comment_id: int):
+        with self._lock:
+            key = str(thread_id)
+            if key not in self._data:
+                self._data[key] = {}
+            self._data[key]["last_comment_id"] = comment_id
+            self._save()
+
+    def get_last_kanban_event_id(self, thread_id: int) -> int:
+        """Kanban→Discord で最後に投稿したイベントID"""
+        with self._lock:
+            return self._data.get(str(thread_id), {}).get("last_kanban_event_id", 0)
+
+    def set_last_kanban_event_id(self, thread_id: int, event_id: int):
+        with self._lock:
+            key = str(thread_id)
+            if key not in self._data:
+                self._data[key] = {}
+            self._data[key]["last_kanban_event_id"] = event_id
+            self._save()
+
     def keys(self) -> list[int]:
         """全追跡スレッドID"""
         with self._lock:

@@ -1,6 +1,7 @@
 """Kanban ↔ Discord Forum 同期のコアロジック。
 task_events ベースの変更検出でポーリング。"""
 
+import json
 import os
 import time
 import logging
@@ -69,6 +70,26 @@ STATUS_TO_TAG, TAG_TO_STATUS, STATUS_TAG_EMOJI = _build_tag_tables(_LANG)
 
 # Statuses that trigger thread archiving (locale-independent)
 ARCHIVE_STATUSES = {"done", "archived"}
+
+# task_events の種別のうち Discord に通知するもの
+_WORKER_LOG_KINDS = ["blocked", "spawned"]
+
+
+def _format_worker_event(ev: dict) -> str:
+    kind = ev["kind"]
+    payload: dict = {}
+    if ev.get("payload"):
+        try:
+            payload = json.loads(ev["payload"])
+        except Exception:
+            pass
+    if kind == "blocked":
+        reason = payload.get("reason", "")
+        return f"🚧 **Blocked**: {reason}" if reason else "🚧 **Blocked**"
+    if kind == "spawned":
+        pid = payload.get("pid", "?")
+        return f"🤖 **Worker spawned** (PID {pid})"
+    return ""
 
 _FORUM_GUIDE_URL = "https://support.discord.com/hc/ja/articles/6208479917079"
 
@@ -378,6 +399,64 @@ class KanbanForumSyncer:
             self._state.tag_sync_count += changed
             logger.info("Tag sync: %d task(s) status updated from forum tags", changed)
 
+    # ---- Phase 1 拡張: Kanban コメント・ワーカーログ → Forum ----
+
+    def _sync_kanban_comments_to_forum(self):
+        """task_comments とワーカーログ (blocked/spawned) を Discord スレッドに投稿する。"""
+        sync_items = self._sync_map.items()
+        if not sync_items:
+            return
+
+        posted = 0
+        for task_id, thread_id in sync_items.items():
+            # --- コメント ---
+            last_comment_id = self._thread_meta.get_last_comment_id(thread_id)
+            try:
+                comments = self.kanban.get_comments_since(task_id, last_comment_id)
+            except Exception as e:
+                logger.warning("Failed to fetch comments for task %s: %s", task_id, e)
+                comments = []
+
+            for c in comments:
+                try:
+                    text = f"💬 **{c['author']}**\n{c['body']}"
+                    self.discord.send_message(thread_id, text[:2000])
+                    self._thread_meta.set_last_comment_id(thread_id, c["id"])
+                    posted += 1
+                    time.sleep(0.5)
+                except Exception as e:
+                    logger.warning(
+                        "Failed to post comment %s to thread %s: %s",
+                        c["id"], thread_id, e,
+                    )
+                    break
+
+            # --- ワーカーログ ---
+            last_ev_id = self._thread_meta.get_last_kanban_event_id(thread_id)
+            try:
+                events = self.kanban.get_events_since(task_id, last_ev_id, _WORKER_LOG_KINDS)
+            except Exception as e:
+                logger.warning("Failed to fetch events for task %s: %s", task_id, e)
+                events = []
+
+            for ev in events:
+                try:
+                    text = _format_worker_event(ev)
+                    if text:
+                        self.discord.send_message(thread_id, text)
+                        posted += 1
+                        time.sleep(0.5)
+                    self._thread_meta.set_last_kanban_event_id(thread_id, ev["id"])
+                except Exception as e:
+                    logger.warning(
+                        "Failed to post event %s to thread %s: %s",
+                        ev["id"], thread_id, e,
+                    )
+                    break
+
+        if posted:
+            logger.info("Synced %d comment/log(s) to forum threads", posted)
+
     # ---- Thread content generation ----
 
     def _thread_title(self, task: dict) -> str:
@@ -490,6 +569,7 @@ class KanbanForumSyncer:
 
         self._sync_forum_comments()
         self._sync_forum_tags()
+        self._sync_kanban_comments_to_forum()
 
     # ---- Thread lifecycle ----
 
