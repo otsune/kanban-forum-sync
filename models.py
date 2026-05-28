@@ -47,6 +47,11 @@ class SyncMap:
             self._data.pop(kanban_id, None)
             self._save()
 
+    def clear(self):
+        with self._lock:
+            self._data.clear()
+            self._save()
+
     def items(self) -> dict[str, int]:
         with self._lock:
             return dict(self._data)

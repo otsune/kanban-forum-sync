@@ -69,25 +69,25 @@ class DiscordForumClient:
                         pass
                     retry_after = retry_info.get("retry_after", 1)
                     logger.warning(
-                        f"Rate limited (attempt {attempt+1}/{max_retries}), "
-                        f"retrying in {retry_after}s"
+                        "Rate limited (attempt %d/%d), retrying in %ss",
+                        attempt + 1, max_retries, retry_after,
                     )
                     time.sleep(retry_after)
                     continue
                 if e.code == 403:
                     raise PermissionError(
-                        f"Bot lacks permission: {error_body}",
+                        "Bot lacks permission: %s" % error_body,
                         http_code=403, body=error_body
                     )
                 if e.code == 404:
                     raise NotFoundError(
-                        f"Resource not found: {path}", http_code=404, body=error_body
+                        "Resource not found: %s" % path, http_code=404, body=error_body
                     )
-                logger.error(f"Discord API error {e.code}: {error_body}")
+                logger.error("Discord API error %s: %s", e.code, error_body)
                 raise DiscordForumError(
-                    f"API error {e.code}: {error_body}", http_code=e.code, body=error_body
+                    "API error %s: %s" % (e.code, error_body), http_code=e.code, body=error_body
                 )
-        raise DiscordForumError(f"Request failed after {max_retries} retries: {path}")
+        raise DiscordForumError("Request failed after %d retries: %s" % (max_retries, path))
 
     # ---- Channel / Guild operations ----
 
@@ -127,13 +127,13 @@ class DiscordForumClient:
         for name in self.FORUM_CANDIDATE_NAMES:
             for ch in forums:
                 if ch["name"].lower() == name:
-                    logger.info(f"Found forum channel #{ch['name']} ({ch['id']})")
+                    logger.info("Found forum channel #%s (%s)", ch["name"], ch["id"])
                     return ch
 
-        # 見つからなければ最初の Forum を返す
         if forums:
             logger.info(
-                f"No named forum found, using first available: #{forums[0]['name']} ({forums[0]['id']})"
+                "No named forum found, using first available: #%s (%s)",
+                forums[0]["name"], forums[0]["id"],
             )
             return forums[0]
 
@@ -150,7 +150,7 @@ class DiscordForumClient:
             "default_forum_layout": 0,
             "default_sort_order": 0,  # latest activity
         }
-        logger.info(f"Creating forum channel #{name} in guild {guild_id}...")
+        logger.info("Creating forum channel #%s in guild %s...", name, guild_id)
         return self._request("POST", f"/guilds/{guild_id}/channels", body)
 
     # ---- Tags ----
@@ -212,9 +212,7 @@ class DiscordForumClient:
         path = f"/channels/{thread_id}/messages?{urlencode(params)}"
         return self._request("GET", path)
 
-    def get_active_threads(self) -> list[dict]:
-        """Forum のアクティブなスレッド一覧を取得"""
-        result = self._request(
-            "GET", f"/channels/{self.channel_id}/threads/active"
-        )
+    def get_active_threads(self, guild_id: int) -> list[dict]:
+        """サーバーのアクティブなスレッド一覧を取得 (Discord API v10)"""
+        result = self._request("GET", f"/guilds/{guild_id}/threads/active")
         return result.get("threads", [])

@@ -27,6 +27,22 @@ HERMES_PLUGINS_DEBUG=1 hermes plugins list
 
 No build step, test suite, or linter is currently configured for this plugin.
 
+## Required Bot permissions
+
+Discord Developer Portal でボットに付与が必要な権限:
+
+| 権限 | 用途 |
+|---|---|
+| `VIEW_CHANNEL` | Forum チャンネルの参照 |
+| `SEND_MESSAGES` | Forum チャンネルへの投稿 |
+| `CREATE_PUBLIC_THREADS` | スレッド作成 |
+| `SEND_MESSAGES_IN_THREADS` | スレッド内メッセージ投稿 |
+| `MANAGE_THREADS` | **必須**: アーカイブ設定 (`archived=True`) |
+| `READ_MESSAGE_HISTORY` | Phase 2 コメント同期 |
+
+`MANAGE_THREADS` なしだと `done`/`archived` ステータスへの同期（スレッドアーカイブ）が 403 で失敗する。  
+`applied_tags` の変更はスレッドオーナー（Bot 自身が作成したスレッド）かつ非 moderated タグなら `MANAGE_THREADS` 不要。
+
 ## Required environment variables
 
 | Variable | Required | Description |
@@ -34,13 +50,15 @@ No build step, test suite, or linter is currently configured for this plugin.
 | `FORUM_SYNC_BOT_TOKEN` | Yes (or `DISCORD_BOT_TOKEN`) | Discord Bot token |
 | `FORUM_SYNC_CHANNEL_ID` | No | Forum channel snowflake; auto-discovered if unset |
 | `FORUM_SYNC_POLL_INTERVAL` | No | Polling interval in seconds (default: 15) |
+| `FORUM_SYNC_EVENT_DRIVEN` | No | Set to `1` to enable inotify-based event-driven sync (Linux only, default: 0) |
 
 ## Architecture
 
 ### Module responsibilities
 
-- **`__init__.py`** — Hermes plugin entry point. `register(ctx)` wires the `post_plugin_init` hook (auto-starts the watcher) and the `kanban-forum-sync` CLI subcommand. Holds the singleton `KanbanForumSyncer`.
-- **`syncer.py`** — Core sync engine (`KanbanForumSyncer`). Runs a daemon thread polling loop. Handles Forum channel auto-resolution, tag management, and both sync directions.
+- **`__init__.py`** — Hermes plugin entry point. `register(ctx)` wires the `kanban-forum-sync` CLI subcommand and auto-starts the watcher. Holds the singleton `KanbanForumSyncer`.
+- **`syncer.py`** — Core sync engine (`KanbanForumSyncer`). Runs a daemon thread in either polling (`_run_loop_poll`) or inotify event-driven (`_run_loop_inotify`) mode. Handles Forum channel auto-resolution, tag management, and both sync directions.
+- **`kanban_watcher.py`** — inotify-based file watcher (`KanbanDBWatcher`). Watches `kanban.db` and `kanban.db-wal` via Linux inotify (ctypes, no extra deps). Context manager; falls back to timeout-only when inotify is unavailable.
 - **`discord_forum.py`** — Thin Discord REST v10 client (`DiscordForumClient`). Uses only stdlib (`urllib`). Includes 3-retry backoff for HTTP 429 rate limits. Raises typed exceptions: `PermissionError` (403), `NotFoundError` (404), `DiscordForumError` (other).
 - **`kanban_bridge.py`** — SQLite bridge to `~/.hermes/kanban.db`. Reads from `tasks` and `task_events` tables; writes comments to `task_comments` and status updates to `tasks` + `task_events`.
 - **`models.py`** — Thread-safe persistent state: `SyncMap` (task_id → thread_id mapping, persisted to `sync_map.json`), `ThreadMetaTracker` (per-thread last-seen message ID, persisted to `thread_meta.json`), `SyncState` (in-memory runtime counters).
@@ -91,7 +109,7 @@ The plugin's `STATUS_TO_TAG` and `TAG_TO_STATUS` include `scheduled` and `review
 
 **Multi-board DB path:** Default is `~/.hermes/kanban.db`, but per-board DBs live at `~/.hermes/kanban/boards/<slug>/kanban.db`. `KanbanBridge` hardcodes the default path (`KANBAN_DB_PATH` constant in `kanban_bridge.py`) and accepts `db_path` as a constructor argument, but `__init__.py` never passes it — there is no env var override. Supporting non-default boards requires wiring an env var (e.g. `FORUM_SYNC_DB_PATH`) through `_get_syncer()` → `KanbanForumSyncer` → `KanbanBridge`.
 
-**Alternative to polling:** Hermes exposes a WebSocket stream at `WS /api/plugins/kanban/events?since=<id>` that emits live events. This could replace the 15 s polling loop for near-real-time sync with lower API overhead, but is not implemented.
+**Event-driven mode (inotify):** `FORUM_SYNC_EVENT_DRIVEN=1` enables `_run_loop_inotify()` which uses Linux inotify to watch `kanban.db` and `kanban.db-wal`. The loop reacts immediately to DB writes instead of sleeping for `POLL_INTERVAL`. `poll_interval` becomes the fallback timeout (runs Phase 2 Discord polling regardless). Implemented in `kanban_watcher.py` via ctypes + select, no extra dependencies. Note: the Hermes source has no `WS /api/plugins/kanban/events` WebSocket endpoint; the "kanban tail" command uses the same DB polling as this plugin.
 
 **Event kinds:** The plugin writes `kind='status_change'` to `task_events`; the official taxonomy uses `kind='status'` for human-driven status edits. These are distinct rows—the plugin's writes won't be misread by Hermes, but they also won't appear under the official `status` event kind in the dashboard.
 

@@ -25,10 +25,12 @@ def _get_syncer():
                 raise RuntimeError(
                     "FORUM_SYNC_BOT_TOKEN も DISCORD_BOT_TOKEN も設定されていません"
                 )
+        use_inotify = os.environ.get("FORUM_SYNC_EVENT_DRIVEN", "").strip().lower() in ("1", "true", "yes")
         _syncer_instance = KanbanForumSyncer(
             bot_token=bot_token,
             channel_id=channel_id,
             poll_interval=int(os.environ.get("FORUM_SYNC_POLL_INTERVAL", "15")),
+            use_inotify=use_inotify,
         )
     return _syncer_instance
 

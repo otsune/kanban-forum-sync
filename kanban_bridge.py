@@ -109,10 +109,10 @@ class KanbanBridge:
                 (task_id, json.dumps({"comment_id": cursor.lastrowid}), now),
             )
             conn.commit()
-            logger.info(f"Added comment to task-{task_id} by {author}")
+            logger.info("Added comment to task-%s by %s", task_id, author)
             return True
         except Exception as e:
-            logger.error(f"Failed to add comment to task {task_id}: {e}")
+            logger.error("Failed to add comment to task %s: %s", task_id, e)
             return False
         finally:
             conn.close()
@@ -131,7 +131,7 @@ class KanbanBridge:
             conn.commit()
             return True
         except Exception as e:
-            logger.error(f"Failed to record event for task {task_id}: {e}")
+            logger.error("Failed to record event for task %s: %s", task_id, e)
             return False
         finally:
             conn.close()
@@ -144,7 +144,7 @@ class KanbanBridge:
                 "SELECT status FROM tasks WHERE id = ?", (task_id,)
             ).fetchone()
             if not row:
-                logger.warning(f"Task {task_id} not found")
+                logger.warning("Task %s not found", task_id)
                 return False
             old_status = row["status"]
             if old_status == new_status:
@@ -164,12 +164,12 @@ class KanbanBridge:
             )
             conn.commit()
             logger.info(
-                f"Task-{task_id} status updated: "
-                f"{old_status} → {new_status} (from forum tag)"
+                "Task-%s status updated: %s → %s (from forum tag)",
+                task_id, old_status, new_status,
             )
             return True
         except Exception as e:
-            logger.error(f"Failed to update task {task_id}: {e}")
+            logger.error("Failed to update task %s: %s", task_id, e)
             return False
         finally:
             conn.close()

@@ -59,9 +59,10 @@ STATUS_TAG_EMOJI = {
     "Done": "🎉",
 }
 
+_FORUM_GUIDE_URL = "https://support.discord.com/hc/ja/articles/6208479917079"
+
 
 def _make_tag_dict(name: str) -> dict:
-    """Forum タグ用の dict を生成"""
     tag = {"name": name, "moderated": False}
     emoji = STATUS_TAG_EMOJI.get(name)
     if emoji:
@@ -94,10 +95,11 @@ class KanbanForumSyncer:
     """Kanban ↔ Discord Forum 同期エンジン"""
 
     def __init__(self, bot_token: str, channel_id: Optional[int] = None,
-                 poll_interval: int = 15):
+                 poll_interval: int = 15, use_inotify: bool = False):
         self.bot_token = bot_token
         self._channel_id = channel_id
         self.poll_interval = poll_interval
+        self._use_inotify = use_inotify
         self._thread: Optional[Thread] = None
         self._stop_event = Event()
         self._state = SyncState()
@@ -105,16 +107,10 @@ class KanbanForumSyncer:
         self.discord = DiscordForumClient(bot_token, self._channel_id)
         self.kanban = KanbanBridge()
 
-        # {kanban_task_id → discord_thread_id}
         self._sync_map = SyncMap()
-
-        # {tag_name → tag_id}
         self._tag_map: dict[str, int] = {}
-
-        # Phase 2: per-thread metadata (last_message_id etc.)
+        self._reverse_tag_map: dict[int, str] = {}
         self._thread_meta = ThreadMetaTracker()
-
-        # Bot 自身のユーザーID（コメントスキップ用）
         self._bot_user_id: Optional[str] = None
 
     @property
@@ -126,168 +122,120 @@ class KanbanForumSyncer:
 
     # ---- Forum channel auto-resolution ----
 
+    def _set_channel(self, channel_id: int) -> None:
+        self._channel_id = channel_id
+        self.discord.channel_id = channel_id
+
+    def _find_or_create_forum_in_guild(self, guild_id: int) -> bool:
+        """指定サーバーで Forum チャンネルを検索し、なければ作成する。"""
+        existing = self.discord.find_forum_channel(guild_id)
+        if existing:
+            self._set_channel(int(existing["id"]))
+            logger.info("Switched to forum #%s (%s)", existing["name"], existing["id"])
+            return True
+        try:
+            created = self.discord.create_forum_channel(guild_id, name="kanban")
+            self._set_channel(int(created["id"]))
+            logger.info("Created forum #kanban (%s)", created["id"])
+            return True
+        except PermissionError:
+            self._state.last_error = (
+                "Bot lacks 'Manage Channels' permission. "
+                "Create a forum channel named 'kanban' or grant the bot 'Manage Channels', "
+                f"then set FORUM_SYNC_CHANNEL_ID. Guide: {_FORUM_GUIDE_URL}"
+            )
+            print(ADMIN_GUIDE_MESSAGE)
+            return False
+        except DiscordForumError as e:
+            self._state.last_error = "Failed to create forum: %s" % e
+            print(ADMIN_GUIDE_MESSAGE)
+            return False
+
     def _resolve_forum_channel(self) -> bool:
         """Forum チャンネルを解決する。
+
         1. channel_id が設定されていて Forum なら OK
-        2. channel_id 未設定 → Bot の参加全サーバーを探索
-        3. 非Forumチャンネル指定 → 同サーバー内を検索/作成
+        2. 非 Forum チャンネル指定 → 同サーバー内を検索/作成
+        3. channel_id 未設定 → Bot の参加全サーバーを探索
         4. 見つからない/作成不可 → 管理者向け案内表示して False
 
         Returns: True=解決成功, False=解決失敗
         """
-        FORUM_GUIDE_URL = "https://support.discord.com/hc/ja/articles/6208479917079"
-
         guild_id = None
 
-        # --- 1. channel_id が設定されている場合 ---
         if self._channel_id is not None:
             try:
                 channel = self.discord.get_channel()
                 if channel.get("type") == FORUM_CHANNEL_TYPE:
                     logger.info(
-                        f"Channel #{channel['name']} "
-                        f"({self._channel_id}) is a valid forum"
+                        "Channel #%s (%s) is a valid forum",
+                        channel["name"], self._channel_id,
                     )
                     return True
-                # 存在するがForumではない → 同サーバー内検索へ
                 guild_id = int(channel["guild_id"])
                 logger.info(
-                    f"Channel #{channel['name']} is type="
-                    f"{channel.get('type')} (not forum). "
-                    f"Searching guild {guild_id}..."
+                    "Channel #%s is type=%s (not forum). Searching guild %s...",
+                    channel["name"], channel.get("type"), guild_id,
                 )
             except (NotFoundError, DiscordForumError) as e:
                 logger.warning(
-                    f"Configured channel {self._channel_id} "
-                    f"not accessible: {e}"
+                    "Configured channel %s not accessible: %s", self._channel_id, e
                 )
                 self._state.last_error = (
-                    f"Channel ID {self._channel_id} is not accessible.\n"
-                    "Please check the channel ID or leave it unset "
-                    "for auto-discovery.\n"
-                    f"作成ガイド: {FORUM_GUIDE_URL}"
+                    "Channel ID %s is not accessible. "
+                    "Leave FORUM_SYNC_CHANNEL_ID unset for auto-discovery. "
+                    "Guide: %s" % (self._channel_id, _FORUM_GUIDE_URL)
                 )
                 print(ADMIN_GUIDE_MESSAGE)
                 return False
 
-        # --- 2. guild_id が不明（channel_id 未設定 or 検出失敗） ---
         if guild_id is None:
             logger.info("No channel_id set. Scanning bot's guilds...")
             try:
                 guilds = self.discord.get_bot_guilds()
             except DiscordForumError as e:
                 self._state.last_error = (
-                    f"Cannot list guilds: {e}\n"
-                    "Bot may lack 'guilds' OAuth2 scope.\n"
-                    "Set FORUM_SYNC_CHANNEL_ID explicitly."
+                    "Cannot list guilds: %s. "
+                    "Bot may lack 'guilds' OAuth2 scope. "
+                    "Set FORUM_SYNC_CHANNEL_ID explicitly." % e
                 )
                 print(ADMIN_GUIDE_MESSAGE)
                 return False
 
-            # 全サーバーの Forum を検索
             for g in guilds:
-                gid = int(g["id"])
-                existing = self.discord.find_forum_channel(gid)
+                existing = self.discord.find_forum_channel(int(g["id"]))
                 if existing:
-                    new_id = int(existing["id"])
+                    self._set_channel(int(existing["id"]))
                     logger.info(
-                        f"Found forum #{existing['name']} ({new_id}) "
-                        f"in guild '{g['name']}' ({gid})"
+                        "Found forum #%s (%s) in guild '%s'",
+                        existing["name"], existing["id"], g["name"],
                     )
-                    self._channel_id = new_id
-                    self.discord.channel_id = new_id
                     return True
 
-            # 全サーバーに Forum なし → 作成試行
-            if guilds:
-                first = guilds[0]
-                gid = int(first["id"])
-                logger.info(
-                    f"No forum found. Attempting to create "
-                    f"in '{first['name']}' ({gid})..."
+            if not guilds:
+                self._state.last_error = (
+                    "Bot is not in any guild. "
+                    "Invite the bot to a server first. Guide: %s" % _FORUM_GUIDE_URL
                 )
-                try:
-                    created = self.discord.create_forum_channel(
-                        gid, name="kanban"
-                    )
-                    new_id = int(created["id"])
-                    logger.info(f"Created forum #kanban ({new_id})")
-                    self._channel_id = new_id
-                    self.discord.channel_id = new_id
-                    return True
-                except PermissionError:
-                    self._state.last_error = (
-                        "Bot lacks 'Manage Channels' permission.\n"
-                        f"作成ガイド: {FORUM_GUIDE_URL}\n\n"
-                        "Ask a server admin to:\n"
-                        "1. Create a forum channel named 'kanban'\n"
-                        "2. Grant 'Manage Channels' to the bot\n"
-                        "3. Or set FORUM_SYNC_CHANNEL_ID explicitly"
-                    )
-                    print(ADMIN_GUIDE_MESSAGE)
-                    return False
-                except DiscordForumError as e:
-                    self._state.last_error = (
-                        f"Failed to create forum: {e}"
-                    )
-                    print(ADMIN_GUIDE_MESSAGE)
-                    return False
+                print(ADMIN_GUIDE_MESSAGE)
+                return False
 
-            # Bot がどのサーバーにも参加していない
-            self._state.last_error = (
-                "Bot is not in any guild. "
-                "Invite the bot to a server first.\n"
-                f"作成ガイド: {FORUM_GUIDE_URL}"
-            )
-            print(ADMIN_GUIDE_MESSAGE)
-            return False
-
-        # --- 3. guild_id 確定済み：同サーバー内で検索/作成 ---
-        existing = self.discord.find_forum_channel(guild_id)
-        if existing:
-            new_id = int(existing["id"])
+            guild_id = int(guilds[0]["id"])
             logger.info(
-                f"Switching to forum #{existing['name']} ({new_id})"
+                "No forum found. Attempting to create in '%s'...", guilds[0]["name"]
             )
-            self._channel_id = new_id
-            self.discord.channel_id = new_id
-            return True
 
-        # 同サーバーに Forum なし → 作成試行
-        try:
-            created = self.discord.create_forum_channel(
-                guild_id, name="kanban"
-            )
-            new_id = int(created["id"])
-            logger.info(f"Created forum #kanban ({new_id})")
-            self._channel_id = new_id
-            self.discord.channel_id = new_id
-            return True
-        except PermissionError:
-            self._state.last_error = (
-                "Bot lacks 'Manage Channels' permission.\n"
-                f"作成ガイド: {FORUM_GUIDE_URL}\n\n"
-                "Ask a server admin to:\n"
-                "1. Create a forum channel named 'kanban'\n"
-                "2. Grant 'Manage Channels' to the bot\n"
-                "3. Or set FORUM_SYNC_CHANNEL_ID explicitly"
-            )
-            print(ADMIN_GUIDE_MESSAGE)
-            return False
-        except DiscordForumError as e:
-            self._state.last_error = f"Failed to create forum: {e}"
-            print(ADMIN_GUIDE_MESSAGE)
-            return False
+        return self._find_or_create_forum_in_guild(guild_id)
 
     # ---- Tag management ----
 
     def _build_tag_map(self):
-        """Forum のタグ一覧を取得し、{tag_name → tag_id} マップを構築"""
         tags = self.discord.get_tags()
         self._tag_map = {t["name"]: t["id"] for t in tags}
+        self._reverse_tag_map = {t["id"]: t["name"] for t in tags}
         logger.info(
-            f"Tag map built with {len(self._tag_map)} tags: "
-            f"{list(self._tag_map.keys())}"
+            "Tag map built with %d tags: %s",
+            len(self._tag_map), list(self._tag_map.keys()),
         )
 
     def _ensure_tags(self):
@@ -298,17 +246,15 @@ class KanbanForumSyncer:
 
         if missing:
             logger.info(
-                f"Creating {len(missing)} missing tags: "
-                f"{[t['name'] for t in missing]}"
+                "Creating %d missing tags: %s",
+                len(missing), [t["name"] for t in missing],
             )
-            new_tags = tags + missing
-            self.discord.create_tags(new_tags)
+            self.discord.create_tags(tags + missing)
             time.sleep(1)  # API反映待ち
         else:
             logger.info("All 8 status tags already exist")
 
     def _resolve_tag_ids(self, status: str) -> list[int]:
-        """ステータスに対応する tag_id のリストを返す"""
         tag_name = STATUS_TO_TAG.get(status)
         if tag_name and tag_name in self._tag_map:
             return [self._tag_map[tag_name]]
@@ -317,21 +263,17 @@ class KanbanForumSyncer:
     # ---- Phase 2: Forum → Kanban feedback sync ----
 
     def _resolve_bot_user_id(self) -> Optional[str]:
-        """Bot 自身のユーザーIDを取得・キャッシュ（自分のメッセージをスキップするため）"""
         if self._bot_user_id is None:
             try:
                 user = self.discord._request("GET", "/users/@me")
                 self._bot_user_id = str(user["id"])
-                logger.info(f"Bot user ID: {self._bot_user_id}")
+                logger.info("Bot user ID: %s", self._bot_user_id)
             except Exception as e:
-                logger.warning(f"Failed to get bot user ID: {e}")
+                logger.warning("Failed to get bot user ID: %s", e)
         return self._bot_user_id
 
     def _sync_forum_comments(self):
-        """Forum スレッドの新規メッセージを検出し、Kanban コメントとして追加する。
-        
-        各スレッドの最後に確認したメッセージID以降の新規メッセージを取得。
-        Bot 自身のメッセージはスキップ。"""
+        """Forum スレッドの新規メッセージを検出し、Kanban コメントとして追加する。"""
         sync_items = self._sync_map.items()
         if not sync_items:
             return
@@ -348,16 +290,15 @@ class KanbanForumSyncer:
                     thread_id, after=after_param, limit=50
                 )
             except Exception as e:
-                logger.warning(
-                    f"Failed to fetch messages for thread {thread_id}: {e}"
-                )
+                logger.warning("Failed to fetch messages for thread %s: %s", thread_id, e)
                 continue
 
             if not messages:
                 continue
 
-            # Discord は新しい順に返す → 古い順に並べ替え
-            messages.reverse()
+            # after なし（初回）は降順、after あり（追加分）は昇順で返る
+            if after_param is None:
+                messages.reverse()
 
             for msg in messages:
                 msg_id = int(msg["id"])
@@ -366,7 +307,6 @@ class KanbanForumSyncer:
                 author_name = author.get("username", "unknown")
                 is_bot = author.get("bot", False)
 
-                # Bot 自身のメッセージはスキップ
                 if is_bot or (bot_id and author_id == bot_id):
                     self._thread_meta.set_last_message_id(thread_id, msg_id)
                     continue
@@ -376,24 +316,19 @@ class KanbanForumSyncer:
                     if self.kanban.add_comment(task_id, author_name, content):
                         new_comments += 1
                         logger.debug(
-                            f"Comment synced: {author_name} → task-{task_id}"
+                            "Comment synced: %s → task-%s", author_name, task_id
                         )
 
-                # 各メッセージ処理後に ID を更新（再同期防止）
                 self._thread_meta.set_last_message_id(thread_id, msg_id)
 
             time.sleep(0.5)  # レート制限
 
         if new_comments:
             self._state.comment_count += new_comments
-            logger.info(f"Synced {new_comments} new comment(s) from forum")
+            logger.info("Synced %d new comment(s) from forum", new_comments)
 
     def _sync_forum_tags(self):
-        """Forum スレッドのタグ変更を検出し、Kanban ステータスに反映する。
-        
-        各スレッドの applied_tags を取得し、タグ名→ステータスのマッピングで
-        Kanban DB の status を更新。自分自身の更新によるタグ変更はスキップするため、
-        無限ループにはならない。"""
+        """Forum スレッドのタグ変更を検出し、Kanban ステータスに反映する。"""
         sync_items = self._sync_map.items()
         if not sync_items:
             return
@@ -403,24 +338,16 @@ class KanbanForumSyncer:
             try:
                 thread = self.discord.get_channel_by_id(thread_id)
             except Exception as e:
-                logger.warning(
-                    f"Failed to fetch thread {thread_id}: {e}"
-                )
+                logger.warning("Failed to fetch thread %s: %s", thread_id, e)
                 continue
 
             applied = thread.get("applied_tags", [])
             if not isinstance(applied, list):
                 continue
 
-            # applied_tags は ID のリスト → 逆引きマップでステータス名に
             new_status = None
             for tag_id in applied:
-                # 逆引き: tag_id → tag_name → status
-                tag_name = None
-                for name, tid in self._tag_map.items():
-                    if tid == tag_id:
-                        tag_name = name
-                        break
+                tag_name = self._reverse_tag_map.get(tag_id)
                 if tag_name and tag_name in TAG_TO_STATUS:
                     new_status = TAG_TO_STATUS[tag_name]
                     break
@@ -431,26 +358,22 @@ class KanbanForumSyncer:
                     if self.kanban.update_task_status(task_id, new_status):
                         changed += 1
                         logger.info(
-                            f"Tag sync: task-{task_id} "
-                            f"{current['status']} → {new_status}"
+                            "Tag sync: task-%s %s → %s",
+                            task_id, current["status"], new_status,
                         )
 
             time.sleep(0.5)
 
         if changed:
             self._state.tag_sync_count += changed
-            logger.info(
-                f"Tag sync: {changed} task(s) status updated from forum tags"
-            )
+            logger.info("Tag sync: %d task(s) status updated from forum tags", changed)
 
     # ---- Thread content generation ----
 
     def _thread_title(self, task: dict) -> str:
-        """タスクからスレッド名を生成"""
         return f"task-{task['id']}: {task['title']}"
 
     def _thread_content(self, task: dict) -> str:
-        """タスクから初期スレッドメッセージを生成"""
         lines = [
             f"**{task['title']}**",
             f"Status: **{task['status']}**",
@@ -459,8 +382,7 @@ class KanbanForumSyncer:
         if task.get("body"):
             lines.append(f"\n{task['body']}")
 
-        details = []
-        details.append(f"Priority: {task.get('priority', '—')}")
+        details = [f"Priority: {task.get('priority', '—')}"]
         if task.get("assignee"):
             details.append(f"Assignee: {task['assignee']}")
         lines.append("\n" + " | ".join(details))
@@ -476,7 +398,6 @@ class KanbanForumSyncer:
 
         try:
             if thread_id is None:
-                # 新規タスク → スレッド作成
                 tag_ids = self._resolve_tag_ids(task["status"])
                 result = self.discord.create_thread(
                     name=self._thread_title(task),
@@ -485,17 +406,13 @@ class KanbanForumSyncer:
                 )
                 new_thread_id = result.get("id")
                 if new_thread_id:
-                    self._sync_map.set(task_id, new_thread_id)
-                    logger.info(
-                        f"Created thread for task-{task_id}: {new_thread_id}"
-                    )
+                    self._sync_map.set(task_id, int(new_thread_id))
+                    logger.info("Created thread for task-%s: %s", task_id, new_thread_id)
                     return True
-                logger.error(f"create_thread returned no id for task-{task_id}")
+                logger.error("create_thread returned no id for task-%s", task_id)
                 return False
             else:
-                # 既存タスク → 差分更新
-                kwargs = {}
-                kwargs["name"] = self._thread_title(task)
+                kwargs = {"name": self._thread_title(task)}
 
                 tag_ids = self._resolve_tag_ids(task["status"])
                 if tag_ids:
@@ -504,20 +421,23 @@ class KanbanForumSyncer:
                 if task["status"] in ARCHIVE_STATUSES:
                     kwargs["archived"] = True
                     kwargs["locked"] = False
+                else:
+                    # アーカイブ済みスレッドへの他フィールド PATCH は 400 になる。
+                    # archived=False を先行して送ることで解除と更新を1リクエストで行う。
+                    # スレッドオーナー（Bot）は MANAGE_THREADS なしに解除できる。
+                    kwargs["archived"] = False
 
-                if kwargs:
-                    self.discord.update_thread(thread_id, **kwargs)
-                    logger.info(f"Updated thread for task-{task_id}")
+                self.discord.update_thread(thread_id, **kwargs)
+                logger.info("Updated thread for task-%s", task_id)
                 return True
         except Exception as e:
-            logger.error(f"Failed to sync task-{task_id}: {e}")
+            logger.error("Failed to sync task-%s: %s", task_id, e)
             return False
 
     def initial_sync(self):
         """初回フル同期"""
         logger.info("Starting initial sync...")
         self._ensure_tags()
-        # タグマップを再構築（新規作成タグの ID を反映）
         self._build_tag_map()
 
         tasks = self.kanban.get_all_tasks()
@@ -529,41 +449,35 @@ class KanbanForumSyncer:
                 synced += 1
             else:
                 errors += 1
-            # レート制限対策: タスク間で最低 0.5 秒待機
             time.sleep(0.5)
 
         self._state.task_count = synced
         self._state.error_count = errors
         self._state.last_sync = str(int(time.time()))
-        logger.info(
-            f"Initial sync complete: {synced} synced, {errors} errors"
-        )
+        logger.info("Initial sync complete: %d synced, %d errors", synced, errors)
 
     def incremental_sync(self):
         """増分同期（1回のポーリング）
 
         Phase 1: Kanban DB の変更を検出 → Forum に反映
         Phase 2: Forum の変更を検出 → Kanban にフィードバック"""
-        # Phase 1: Kanban → Forum
         last_id = self._state.last_event_id
         changed = self.kanban.get_tasks_changed_since_event(last_id)
 
         if changed:
             logger.info(
-                f"Incremental sync: {len(changed)} changed tasks "
-                f"(events > {last_id})"
+                "Incremental sync: %d changed tasks (events > %d)",
+                len(changed), last_id,
             )
             for task in changed:
                 self._sync_task_to_forum(task)
                 time.sleep(0.5)
 
-        # Poll 最新のイベント ID を記録
         latest_event = self.kanban.get_latest_event_id()
         if latest_event > self._state.last_event_id:
             self._state.last_event_id = latest_event
-            logger.debug(f"Updated last_event_id to {latest_event}")
+            logger.debug("Updated last_event_id to %d", latest_event)
 
-        # Phase 2: Forum → Kanban feedback
         self._sync_forum_comments()
         self._sync_forum_tags()
 
@@ -581,7 +495,8 @@ class KanbanForumSyncer:
         )
         self._thread.start()
         self._state.state = "running"
-        logger.info(f"Syncer started (poll interval: {self.poll_interval}s)")
+        mode = "inotify" if self._use_inotify else "poll"
+        logger.info("Syncer started (mode: %s, interval: %ds)", mode, self.poll_interval)
 
     def stop(self):
         """ポーリングループを停止"""
@@ -592,8 +507,13 @@ class KanbanForumSyncer:
         logger.info("Syncer stopped")
 
     def _run_loop(self):
-        """ポーリングループ本体"""
-        # 起動時に Forum チャンネルを解決
+        if self._use_inotify:
+            self._run_loop_inotify()
+        else:
+            self._run_loop_poll()
+
+    def _run_loop_poll(self):
+        """固定間隔ポーリングループ"""
         if not self._resolve_forum_channel():
             self._state.state = "error"
             logger.error("Forum channel resolution failed. Sync aborted.")
@@ -602,7 +522,7 @@ class KanbanForumSyncer:
         try:
             self.initial_sync()
         except Exception as e:
-            logger.error(f"Initial sync failed: {e}", exc_info=True)
+            logger.error("Initial sync failed: %s", e, exc_info=True)
             self._state.state = "error"
             self._state.last_error = str(e)
             return
@@ -611,18 +531,50 @@ class KanbanForumSyncer:
             try:
                 self.incremental_sync()
             except Exception as e:
-                logger.error(f"Incremental sync failed: {e}", exc_info=True)
+                logger.error("Incremental sync failed: %s", e, exc_info=True)
                 self._state.last_error = str(e)
             self._stop_event.wait(self.poll_interval)
 
+    def _run_loop_inotify(self):
+        """inotify によるイベント駆動ループ。
+
+        kanban.db への書き込みを OS が即座に通知する。
+        poll_interval はフォールバック（Phase 2 Discord ポーリング含む）として使用。
+        inotify 未使用環境では自動的にインターバル待機に縮退する。
+        """
+        if not self._resolve_forum_channel():
+            self._state.state = "error"
+            logger.error("Forum channel resolution failed. Sync aborted.")
+            return
+
+        try:
+            self.initial_sync()
+        except Exception as e:
+            logger.error("Initial sync failed: %s", e, exc_info=True)
+            self._state.state = "error"
+            self._state.last_error = str(e)
+            return
+
+        from .kanban_watcher import KanbanDBWatcher
+        logger.info(
+            "Event-driven sync active (inotify) — watching %s", self.kanban.db_path
+        )
+        with KanbanDBWatcher(self.kanban.db_path) as watcher:
+            while not self._stop_event.is_set():
+                watcher.wait(timeout=self.poll_interval)
+                if self._stop_event.is_set():
+                    break
+                try:
+                    self.incremental_sync()
+                except Exception as e:
+                    logger.error("Incremental sync failed: %s", e, exc_info=True)
+                    self._state.last_error = str(e)
+
     def full_sync(self):
         """手動フル同期（CLI/スラッシュコマンド用）"""
-        # チャンネル解決もやり直す
         if not self._resolve_forum_channel():
             return
         self._ensure_tags()
         self._build_tag_map()
-        # 既存の同期マップをクリアして再同期
-        for task_id in list(self._sync_map.items().keys()):
-            self._sync_map.remove(task_id)
+        self._sync_map.clear()
         self.initial_sync()
