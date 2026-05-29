@@ -387,6 +387,19 @@ class KanbanForumSyncer:
             if new_status:
                 current = self.kanban.get_task(task_id)
                 if current and current["status"] != new_status:
+                    # Don't resurrect archived/done tasks via Forum tag sync.
+                    # This prevents an infinite loop where:
+                    #   1. Task is completed → archived by the system
+                    #   2. Archived thread still has a stale tag (e.g. Todo/Ready)
+                    #   3. Tag sync reads the stale tag → changes status back to active
+                    #   4. Dispatcher spawns a new worker → archived again → loop
+                    if current["status"] in ("archived", "done"):
+                        logger.debug(
+                            "Tag sync: skipping task-%s (%s) — "
+                            "won't resurrect archived/done task to %s",
+                            task_id, current["status"], new_status,
+                        )
+                        continue
                     if self.kanban.update_task_status(task_id, new_status):
                         changed += 1
                         logger.info(

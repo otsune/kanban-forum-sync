@@ -6,12 +6,9 @@ import os
 import threading
 from typing import Optional
 
-SYNC_MAP_PATH = os.path.expanduser(
-    "~/.hermes/plugins/kanban-forum-sync/sync_map.json"
-)
-THREAD_META_PATH = os.path.expanduser(
-    "~/.hermes/plugins/kanban-forum-sync/thread_meta.json"
-)
+_PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
+SYNC_MAP_PATH = os.path.join(_PLUGIN_DIR, "sync_map.json")
+THREAD_META_PATH = os.path.join(_PLUGIN_DIR, "thread_meta.json")
 
 
 class SyncMap:
@@ -82,9 +79,7 @@ class SyncOriginTracker:
     永続化: sync_map.json と同じディレクトリに origin_map.json として保存。
     """
 
-    ORIGIN_PATH = os.path.expanduser(
-        "~/.hermes/plugins/kanban-forum-sync/origin_map.json"
-    )
+    ORIGIN_PATH = os.path.join(_PLUGIN_DIR, "origin_map.json")
 
     def __init__(self, path: str = ORIGIN_PATH):
         self._path = path
