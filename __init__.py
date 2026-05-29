@@ -68,6 +68,7 @@ def cli_status(args):
     print(f"Errors: {state.error_count}")
     print(f"Comments synced (Phase 2): {state.comment_count}")
     print(f"Tag syncs (Phase 2): {state.tag_sync_count}")
+    print(f"Forum→Kanban tasks created (Phase 3): {state.forum_task_count}")
     if state.last_error:
         print(f"Last error: {state.last_error}")
 

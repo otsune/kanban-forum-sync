@@ -114,6 +114,49 @@ class KanbanBridge:
         finally:
             conn.close()
 
+    # ---- 書き込み（Phase 2 + Phase 3: 新規タスク作成含む） ----
+
+    def create_task(self, title: str, body: str = "",
+                    status: str = "triage",
+                    assignee: Optional[str] = None) -> Optional[str]:
+        """Forum スレッドから新規 Kanban タスクを作成。
+
+        Returns the new task id, or None on failure.
+        ステータスデフォルトは ``triage`` — 確認・割り振りが必要な状態。
+        """
+        if not title or not title.strip():
+            logger.error("create_task: title is required")
+            return None
+        import uuid
+        task_id = f"t_{uuid.uuid4().hex[:8]}"
+        now = int(time.time())
+        conn = self._connect()
+        try:
+            conn.execute(
+                "INSERT INTO tasks "
+                "(id, title, body, assignee, status, priority, created_at) "
+                "VALUES (?, ?, ?, ?, ?, 0, ?)",
+                (task_id, title.strip(), body, assignee, status, now),
+            )
+            payload = json.dumps({
+                "title": title.strip(),
+                "status": status,
+                "source": "forum_thread_sync",
+            })
+            conn.execute(
+                "INSERT INTO task_events (task_id, kind, payload, created_at) "
+                "VALUES (?, 'created', ?, ?)",
+                (task_id, payload, now),
+            )
+            conn.commit()
+            logger.info("Created task-%s from forum thread: %s", task_id, title)
+            return task_id
+        except Exception as e:
+            logger.error("Failed to create task from forum thread: %s", e)
+            return None
+        finally:
+            conn.close()
+
     # ---- 書き込み（Phase 2: フィードバック同期用） ----
 
     def add_comment(self, task_id: str, author: str, body: str) -> bool:

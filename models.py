@@ -56,6 +56,69 @@ class SyncMap:
         with self._lock:
             return dict(self._data)
 
+    def contains_thread(self, thread_id: int) -> bool:
+        """この thread_id がすでに同期マップに存在するかを確認。
+
+        Forum → Kanban の新規スレッド検出で使用。
+        """
+        with self._lock:
+            return thread_id in self._data.values()
+
+    def get_by_thread_id(self, thread_id: int) -> Optional[str]:
+        """thread_id に対応する Kanban task_id を逆引きする。"""
+        with self._lock:
+            for task_id, tid in self._data.items():
+                if tid == thread_id:
+                    return task_id
+        return None
+
+
+class SyncOriginTracker:
+    """タスクの起源を追跡。
+
+    - ``kanban``: Kanban 側で作成されたタスク（通常の Phase 1 → Forum スレッド作成）
+    - ``forum``: Forum スレッドから自動作成されたタスク（Phase 3）
+
+    永続化: sync_map.json と同じディレクトリに origin_map.json として保存。
+    """
+
+    ORIGIN_PATH = os.path.expanduser(
+        "~/.hermes/plugins/kanban-forum-sync/origin_map.json"
+    )
+
+    def __init__(self, path: str = ORIGIN_PATH):
+        self._path = path
+        self._lock = threading.RLock()
+        self._data: dict[str, str] = {}  # task_id → "kanban" | "forum"
+        self._load()
+
+    def _load(self):
+        if os.path.exists(self._path):
+            with open(self._path) as f:
+                self._data = json.load(f)
+
+    def _save(self):
+        os.makedirs(os.path.dirname(self._path), exist_ok=True)
+        with open(self._path, "w") as f:
+            json.dump(self._data, f, indent=2)
+
+    def set_origin(self, task_id: str, origin: str):
+        with self._lock:
+            self._data[task_id] = origin
+            self._save()
+
+    def get_origin(self, task_id: str) -> str:
+        with self._lock:
+            return self._data.get(task_id, "kanban")
+
+    def is_forum_sourced(self, task_id: str) -> bool:
+        return self.get_origin(task_id) == "forum"
+
+    def clear(self):
+        with self._lock:
+            self._data.clear()
+            self._save()
+
 
 class SyncState:
     """同期エンジンの実行状態"""
@@ -69,6 +132,7 @@ class SyncState:
         self.last_error: Optional[str] = None
         self.comment_count: int = 0  # Phase 2: 同期したコメント数
         self.tag_sync_count: int = 0  # Phase 2: 同期したタグ変更数
+        self.forum_task_count: int = 0  # Phase 3: Forum → Kanban で作成したタスク数
 
 
 class ThreadMetaTracker:

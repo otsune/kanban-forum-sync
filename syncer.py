@@ -16,7 +16,7 @@ from .discord_forum import (
     FORUM_CHANNEL_TYPE,
 )
 from .kanban_bridge import KanbanBridge
-from .models import SyncState, SyncMap, ThreadMetaTracker
+from .models import SyncState, SyncMap, SyncOriginTracker, ThreadMetaTracker
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +139,7 @@ class KanbanForumSyncer:
         self.kanban = KanbanBridge()
 
         self._sync_map = SyncMap()
+        self._origin_tracker = SyncOriginTracker()
         self._tag_map: dict[str, int] = {}
         self._reverse_tag_map: dict[int, str] = {}
         self._thread_meta = ThreadMetaTracker()
@@ -399,6 +400,97 @@ class KanbanForumSyncer:
             self._state.tag_sync_count += changed
             logger.info("Tag sync: %d task(s) status updated from forum tags", changed)
 
+    # ---- Phase 3: Forum 新規スレッド → Kanban タスク作成 ----
+
+    def _sync_forum_new_threads(self):
+        """Forum チャンネルに新しく作成されたスレッドを検出し、Kanban タスクを作成する。
+
+        同期マップに存在しないスレッドを見つけ、タイトル・本文・タグから
+        新しい Kanban タスクを生成する。
+        """
+        if self.channel_id is None:
+            return
+
+        try:
+            threads = self.discord.get_channel_active_threads()
+        except Exception as e:
+            logger.warning("Failed to fetch active threads: %s", e)
+            return
+
+        if not threads:
+            return
+
+        new_count = 0
+        for thread in threads:
+            thread_id = int(thread["id"])
+            thread_name = thread.get("name", "").strip()
+
+            # Bot が作ったスレッド（task- プレフィックス）はスキップ
+            if thread_name.lower().startswith("task-"):
+                continue
+
+            # すでに同期マップにあるスレッドはスキップ
+            if self._sync_map.contains_thread(thread_id):
+                continue
+
+            # スレッドのスターターポスト（最初のメッセージ）を本文として取得
+            body_lines = []
+            try:
+                msgs = self.discord.get_thread_messages(thread_id, limit=50)
+                if msgs:
+                    # API は降順（最新が先頭）。一番古いメッセージ = スターターポスト
+                    for msg in reversed(msgs):
+                        author = msg.get("author", {})
+                        if author.get("bot", False):
+                            continue
+                        body_lines.append(msg.get("content", "").strip())
+                        break  # 最初の人間の発言だけ取る
+            except Exception as e:
+                logger.debug("Failed to get first message for thread %s: %s", thread_id, e)
+
+            body = "\n".join(line for line in body_lines if line)
+
+            # タグから初期ステータスを解決
+            status = "triage"
+            applied_tags = thread.get("applied_tags", [])
+            if isinstance(applied_tags, list):
+                for tag_id in applied_tags:
+                    tag_name = self._reverse_tag_map.get(tag_id)
+                    if tag_name and tag_name in TAG_TO_STATUS:
+                        resolved = TAG_TO_STATUS[tag_name]
+                        # backlog は triage にマップ（非標準ステータス回避）
+                        if resolved == "backlog":
+                            resolved = "triage"
+                        status = resolved
+                        break
+
+            # Kanban タスク作成
+            task_id = self.kanban.create_task(
+                title=thread_name,
+                body=body,
+                status=status,
+            )
+            if task_id:
+                self._sync_map.set(task_id, thread_id)
+                self._origin_tracker.set_origin(task_id, "forum")
+                self._state.task_count += 1
+                self._state.forum_task_count += 1
+                new_count += 1
+                logger.info(
+                    "Forum → Kanban: created task-%s from thread '%s' (status=%s)",
+                    task_id, thread_name, status,
+                )
+            else:
+                logger.error(
+                    "Failed to create Kanban task from forum thread '%s'",
+                    thread_name,
+                )
+
+            time.sleep(0.5)  # レート制限
+
+        if new_count:
+            logger.info("Phase 3: created %d Kanban task(s) from new forum threads", new_count)
+
     # ---- Phase 1 拡張: Kanban コメント・ワーカーログ → Forum ----
 
     def _sync_kanban_comments_to_forum(self):
@@ -501,7 +593,11 @@ class KanbanForumSyncer:
                 logger.error("create_thread returned no id for task-%s", task_id)
                 return False
             else:
-                kwargs = {"name": self._thread_title(task)}
+                kwargs: dict = {}
+
+                # Forum 発祥のスレッドは名前を書き換えない（人間がつけたタイトルを保持）
+                if not self._origin_tracker.is_forum_sourced(task_id):
+                    kwargs["name"] = self._thread_title(task)
 
                 tag_ids = self._resolve_tag_ids(task["status"])
                 if tag_ids:
@@ -569,6 +665,7 @@ class KanbanForumSyncer:
 
         self._sync_forum_comments()
         self._sync_forum_tags()
+        self._sync_forum_new_threads()
         self._sync_kanban_comments_to_forum()
 
     # ---- Thread lifecycle ----
@@ -667,4 +764,5 @@ class KanbanForumSyncer:
         self._ensure_tags()
         self._build_tag_map()
         self._sync_map.clear()
+        self._origin_tracker.clear()
         self.initial_sync()

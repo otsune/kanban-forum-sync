@@ -225,3 +225,16 @@ class DiscordForumClient:
         """サーバーのアクティブなスレッド一覧を取得 (Discord API v10)"""
         result = self._request("GET", f"/guilds/{guild_id}/threads/active")
         return result.get("threads", [])
+
+    def get_channel_active_threads(self) -> list[dict]:
+        """Forum チャンネルのアクティブなスレッド一覧を取得。
+
+        ``self.channel_id`` が必要。Forum に新規スレッドができたか検出するために使用。
+        Discord API v10: GET /channels/{channel_id}/threads/active
+        """
+        if self.channel_id is None:
+            raise ValueError("channel_id is not set")
+        result = self._request(
+            "GET", f"/channels/{self.channel_id}/threads/active"
+        )
+        return result.get("threads", [])
