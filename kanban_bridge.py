@@ -41,16 +41,17 @@ class KanbanBridge:
 
     def get_tasks_changed_since_event(self, last_event_id: int) -> list[dict]:
         """指定イベントID以降に変更があった全タスクを取得。
-        重複排除のためDISTINCT + latest event で1タスク1行。"""
+        重複排除のため GROUP BY t.id で1タスク1行に厳密に制限。"""
         conn = self._connect()
         try:
             rows = conn.execute(
-                "SELECT DISTINCT t.id, t.title, t.body, t.status, "
+                "SELECT t.id, t.title, t.body, t.status, "
                 "t.priority, t.assignee, t.created_at, t.completed_at "
                 "FROM tasks t "
                 "JOIN task_events e ON t.id = e.task_id "
                 "WHERE e.id > ? "
-                "ORDER BY e.id ASC",
+                "GROUP BY t.id "
+                "ORDER BY MAX(e.id) ASC",
                 (last_event_id,),
             ).fetchall()
             return [dict(r) for r in rows]
