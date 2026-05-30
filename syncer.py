@@ -103,7 +103,26 @@ def _make_tag_dict(name: str, emoji: str = "") -> dict:
 
 REQUIRED_TAGS = [_make_tag_dict(name, emoji) for name, emoji in STATUS_TAG_EMOJI.items()]
 
-ADMIN_GUIDE_MESSAGE = """
+# ---- i18n: admin guide messages ----
+ADMIN_GUIDE_MESSAGES: dict[str, str] = {
+    "en": """\
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+⚠️  Discord Forum channel does not exist
+
+The bot lacks permission to create channels, so auto-creation failed.
+Please ask your server administrator to perform the following steps:
+
+1. Open Discord Server Settings
+2. Go to "Channels" → "Create Channel"
+3. Channel type: "Forum"
+4. Name: "kanban" (or task-board)
+5. After creation, set the channel ID via environment variable:
+   FORUM_SYNC_CHANNEL_ID=<channel_id>
+
+Alternatively, grant the bot the "Manage Channels" permission to allow auto-creation.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+""",
+    "ja": """\
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ⚠️  Discord Forum チャンネルが存在しません
 
@@ -119,7 +138,13 @@ Bot にチャンネル作成権限がないため、自動生成できません�
 
 または、Bot に「チャンネルを管理」権限を付与すれば自動生成されます。
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-"""
+""",
+}
+
+
+def get_admin_guide_message() -> str:
+    """現在の FORUM_SYNC_LANG に応じた管理者向け案内メッセージを返す。"""
+    return ADMIN_GUIDE_MESSAGES.get(_LANG, ADMIN_GUIDE_MESSAGES["en"])
 
 
 class KanbanForumSyncer:
@@ -176,11 +201,11 @@ class KanbanForumSyncer:
                 "Create a forum channel named 'kanban' or grant the bot 'Manage Channels', "
                 f"then set FORUM_SYNC_CHANNEL_ID. Guide: {_FORUM_GUIDE_URL}"
             )
-            print(ADMIN_GUIDE_MESSAGE)
+            print(get_admin_guide_message())
             return False
         except DiscordForumError as e:
             self._state.last_error = "Failed to create forum: %s" % e
-            print(ADMIN_GUIDE_MESSAGE)
+            print(get_admin_guide_message())
             return False
 
     def _resolve_forum_channel(self) -> bool:
@@ -218,7 +243,7 @@ class KanbanForumSyncer:
                     "Leave FORUM_SYNC_CHANNEL_ID unset for auto-discovery. "
                     "Guide: %s" % (self._channel_id, _FORUM_GUIDE_URL)
                 )
-                print(ADMIN_GUIDE_MESSAGE)
+                print(get_admin_guide_message())
                 return False
 
         if guild_id is None:
@@ -231,7 +256,7 @@ class KanbanForumSyncer:
                     "Bot may lack 'guilds' OAuth2 scope. "
                     "Set FORUM_SYNC_CHANNEL_ID explicitly." % e
                 )
-                print(ADMIN_GUIDE_MESSAGE)
+                print(get_admin_guide_message())
                 return False
 
             for g in guilds:
@@ -249,7 +274,7 @@ class KanbanForumSyncer:
                     "Bot is not in any guild. "
                     "Invite the bot to a server first. Guide: %s" % _FORUM_GUIDE_URL
                 )
-                print(ADMIN_GUIDE_MESSAGE)
+                print(get_admin_guide_message())
                 return False
 
             guild_id = int(guilds[0]["id"])
