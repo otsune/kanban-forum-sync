@@ -11,6 +11,7 @@ from .syncer import KanbanForumSyncer
 
 logger = logging.getLogger(__name__)
 _syncer_instance = None
+_plugin_ctx = None
 
 
 def _get_syncer():
@@ -31,6 +32,7 @@ def _get_syncer():
             channel_id=channel_id,
             poll_interval=int(os.environ.get("FORUM_SYNC_POLL_INTERVAL", "15")),
             use_inotify=use_inotify,
+            ctx=_plugin_ctx,
         )
     return _syncer_instance
 
@@ -57,7 +59,9 @@ def cli_setup(parser):
 
 
 def cli_status(args):
-    syncer = _get_syncer()
+    syncer = _get_syncer_or_print_error()
+    if syncer is None:
+        return
     state = syncer.get_state()
     ch = syncer.channel_id or "(auto)"
     print(f"Syncer state: {state.state}")
@@ -74,27 +78,45 @@ def cli_status(args):
 
 
 def cli_start(args):
-    syncer = _get_syncer()
+    syncer = _get_syncer_or_print_error()
+    if syncer is None:
+        return
     syncer.start()
     print("Watcher started.")
 
 
 def cli_stop(args):
-    syncer = _get_syncer()
+    syncer = _get_syncer_or_print_error()
+    if syncer is None:
+        return
     syncer.stop()
     print("Watcher stopped.")
 
 
 def cli_sync(args):
-    syncer = _get_syncer()
+    syncer = _get_syncer_or_print_error()
+    if syncer is None:
+        return
     syncer.full_sync()
     print("Full sync complete.")
+
+
+def _get_syncer_or_print_error():
+    try:
+        return _get_syncer()
+    except RuntimeError as e:
+        print(f"kanban-forum-sync: {e}")
+        return None
 
 
 # ---- 登録 ----
 
 
 def register(ctx):
+    global _plugin_ctx
+    _plugin_ctx = ctx
+    if _syncer_instance is not None:
+        _syncer_instance.kanban.ctx = ctx
     ctx.register_cli_command(
         "kanban-forum-sync",
         "Kanban ↔ Discord Forum sync management",

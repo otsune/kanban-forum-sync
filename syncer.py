@@ -11,7 +11,7 @@ from typing import Optional
 from .discord_forum import (
     DiscordForumClient,
     DiscordForumError,
-    PermissionError,
+    DiscordPermissionError,
     NotFoundError,
     FORUM_CHANNEL_TYPE,
 )
@@ -40,6 +40,12 @@ _EXTRA_TAGS: dict[str, dict[str, str]] = {
 }
 
 _SUPPORTED_LANGS = ("en", "ja")
+_KANBAN_STATUSES = {"triage", "todo", "ready", "running", "blocked", "done", "archived"}
+_STATUS_ALIASES = {
+    "backlog": "triage",
+    "scheduled": "ready",
+    "review": "running",
+}
 
 
 def _build_tag_tables(lang: str) -> tuple[dict, dict, dict]:
@@ -73,6 +79,11 @@ ARCHIVE_STATUSES = {"done", "archived"}
 
 # task_events の種別のうち Discord に通知するもの
 _WORKER_LOG_KINDS = ["blocked", "spawned"]
+
+
+def _normalize_kanban_status(status: str) -> Optional[str]:
+    status = _STATUS_ALIASES.get(status, status)
+    return status if status in _KANBAN_STATUSES else None
 
 
 def _format_worker_event(ev: dict) -> str:
@@ -151,7 +162,7 @@ class KanbanForumSyncer:
     """Kanban ↔ Discord Forum 同期エンジン"""
 
     def __init__(self, bot_token: str, channel_id: Optional[int] = None,
-                 poll_interval: int = 15, use_inotify: bool = False):
+                 poll_interval: int = 15, use_inotify: bool = False, ctx=None):
         self.bot_token = bot_token
         self._channel_id = channel_id
         self.poll_interval = poll_interval
@@ -161,7 +172,7 @@ class KanbanForumSyncer:
         self._state = SyncState()
 
         self.discord = DiscordForumClient(bot_token, self._channel_id)
-        self.kanban = KanbanBridge()
+        self.kanban = KanbanBridge(ctx=ctx)
 
         self._sync_map = SyncMap()
         self._origin_tracker = SyncOriginTracker()
@@ -195,7 +206,7 @@ class KanbanForumSyncer:
             self._set_channel(int(created["id"]))
             logger.info("Created forum #kanban (%s)", created["id"])
             return True
-        except PermissionError:
+        except DiscordPermissionError:
             self._state.last_error = (
                 "Bot lacks 'Manage Channels' permission. "
                 "Create a forum channel named 'kanban' or grant the bot 'Manage Channels', "
@@ -353,30 +364,43 @@ class KanbanForumSyncer:
             if not messages:
                 continue
 
-            # after なし（初回）は降順、after あり（追加分）は昇順で返る
-            if after_param is None:
-                messages.reverse()
+            messages = sorted(messages, key=lambda m: int(m["id"]))
+            max_processed_id = last_id
 
             for msg in messages:
                 msg_id = int(msg["id"])
+                if msg_id <= last_id:
+                    continue
+
                 author = msg["author"]
                 author_id = str(author.get("id", ""))
                 author_name = author.get("username", "unknown")
                 is_bot = author.get("bot", False)
 
                 if is_bot or (bot_id and author_id == bot_id):
-                    self._thread_meta.set_last_message_id(thread_id, msg_id)
+                    max_processed_id = max(max_processed_id, msg_id)
                     continue
 
                 content = msg.get("content", "").strip()
                 if content:
                     if self.kanban.add_comment(task_id, author_name, content):
                         new_comments += 1
+                        max_processed_id = max(max_processed_id, msg_id)
                         logger.debug(
                             "Comment synced: %s → task-%s", author_name, task_id
                         )
+                    else:
+                        logger.warning(
+                            "Comment sync failed for thread %s message %s; "
+                            "cursor left at %s for retry",
+                            thread_id, msg_id, max_processed_id,
+                        )
+                        break
+                else:
+                    max_processed_id = max(max_processed_id, msg_id)
 
-                self._thread_meta.set_last_message_id(thread_id, msg_id)
+            if max_processed_id > last_id:
+                self._thread_meta.set_last_message_id(thread_id, max_processed_id)
 
             time.sleep(0.5)  # レート制限
 
@@ -406,8 +430,9 @@ class KanbanForumSyncer:
             for tag_id in applied:
                 tag_name = self._reverse_tag_map.get(tag_id)
                 if tag_name and tag_name in TAG_TO_STATUS:
-                    new_status = TAG_TO_STATUS[tag_name]
-                    break
+                    new_status = _normalize_kanban_status(TAG_TO_STATUS[tag_name])
+                    if new_status:
+                        break
 
             if new_status:
                 current = self.kanban.get_task(task_id)
@@ -496,11 +521,10 @@ class KanbanForumSyncer:
                     tag_name = self._reverse_tag_map.get(tag_id)
                     if tag_name and tag_name in TAG_TO_STATUS:
                         resolved = TAG_TO_STATUS[tag_name]
-                        # backlog は triage にマップ（非標準ステータス回避）
-                        if resolved == "backlog":
-                            resolved = "triage"
-                        status = resolved
-                        break
+                        normalized = _normalize_kanban_status(resolved)
+                        if normalized:
+                            status = normalized
+                            break
 
             # Kanban タスク作成
             task_id = self.kanban.create_task(
@@ -573,7 +597,7 @@ class KanbanForumSyncer:
                 try:
                     text = _format_worker_event(ev)
                     if text:
-                        self.discord.send_message(thread_id, text)
+                        self.discord.send_message(thread_id, text[:2000])
                         posted += 1
                         time.sleep(0.5)
                     self._thread_meta.set_last_kanban_event_id(thread_id, ev["id"])
@@ -638,7 +662,7 @@ class KanbanForumSyncer:
                     kwargs["name"] = self._thread_title(task)
 
                 tag_ids = self._resolve_tag_ids(task["status"])
-                if tag_ids:
+                if tag_ids and not self._origin_tracker.is_forum_sourced(task_id):
                     kwargs["applied_tags"] = tag_ids
 
                 if task["status"] in ARCHIVE_STATUSES:
@@ -676,6 +700,7 @@ class KanbanForumSyncer:
 
         self._state.task_count = synced
         self._state.error_count = errors
+        self._state.last_event_id = self.kanban.get_latest_event_id()
         self._state.last_sync = str(int(time.time()))
         logger.info("Initial sync complete: %d synced, %d errors", synced, errors)
 
@@ -737,19 +762,33 @@ class KanbanForumSyncer:
         else:
             self._run_loop_poll()
 
+    def _prepare_initial_sync(self) -> bool:
+        delay = max(1, min(self.poll_interval, 30))
+        while not self._stop_event.is_set():
+            if not self._resolve_forum_channel():
+                self._state.state = "error"
+                logger.error(
+                    "Forum channel resolution failed. Retrying in %ss.", delay
+                )
+                self._stop_event.wait(delay)
+                delay = min(delay * 2, 300)
+                continue
+
+            try:
+                self.initial_sync()
+                self._state.state = "running"
+                return True
+            except Exception as e:
+                logger.error("Initial sync failed: %s", e, exc_info=True)
+                self._state.state = "error"
+                self._state.last_error = str(e)
+                self._stop_event.wait(delay)
+                delay = min(delay * 2, 300)
+        return False
+
     def _run_loop_poll(self):
         """固定間隔ポーリングループ"""
-        if not self._resolve_forum_channel():
-            self._state.state = "error"
-            logger.error("Forum channel resolution failed. Sync aborted.")
-            return
-
-        try:
-            self.initial_sync()
-        except Exception as e:
-            logger.error("Initial sync failed: %s", e, exc_info=True)
-            self._state.state = "error"
-            self._state.last_error = str(e)
+        if not self._prepare_initial_sync():
             return
 
         while not self._stop_event.is_set():
@@ -767,17 +806,7 @@ class KanbanForumSyncer:
         poll_interval はフォールバック（Phase 2 Discord ポーリング含む）として使用。
         inotify 未使用環境では自動的にインターバル待機に縮退する。
         """
-        if not self._resolve_forum_channel():
-            self._state.state = "error"
-            logger.error("Forum channel resolution failed. Sync aborted.")
-            return
-
-        try:
-            self.initial_sync()
-        except Exception as e:
-            logger.error("Initial sync failed: %s", e, exc_info=True)
-            self._state.state = "error"
-            self._state.last_error = str(e)
+        if not self._prepare_initial_sync():
             return
 
         from .kanban_watcher import KanbanDBWatcher

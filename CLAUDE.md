@@ -60,8 +60,8 @@ Discord Developer Portal でボットに付与が必要な権限:
 - **`__init__.py`** — Hermes plugin entry point. `register(ctx)` wires the `kanban-forum-sync` CLI subcommand and auto-starts the watcher. Holds the singleton `KanbanForumSyncer`.
 - **`syncer.py`** — Core sync engine (`KanbanForumSyncer`). Runs a daemon thread in either polling (`_run_loop_poll`) or inotify event-driven (`_run_loop_inotify`) mode. Handles Forum channel auto-resolution, tag management, and both sync directions.
 - **`kanban_watcher.py`** — inotify-based file watcher (`KanbanDBWatcher`). Watches `kanban.db` and `kanban.db-wal` via Linux inotify (ctypes, no extra deps). Context manager; falls back to timeout-only when inotify is unavailable.
-- **`discord_forum.py`** — Thin Discord REST v10 client (`DiscordForumClient`). Uses only stdlib (`urllib`). Includes 3-retry backoff for HTTP 429 rate limits. Raises typed exceptions: `PermissionError` (403), `NotFoundError` (404), `DiscordForumError` (other).
-- **`kanban_bridge.py`** — SQLite bridge to `~/.hermes/kanban.db`. Reads from `tasks` and `task_events` tables; writes comments to `task_comments` and status updates to `tasks` + `task_events`.
+- **`discord_forum.py`** — Thin Discord REST v10 client (`DiscordForumClient`). Uses only stdlib (`urllib`). Includes 3-retry backoff for HTTP 429 rate limits. Raises typed exceptions: `DiscordPermissionError` (403), `NotFoundError` (404), `DiscordForumError` (other).
+- **`kanban_bridge.py`** — Kanban bridge. Reads from `~/.hermes/kanban.db` with a 120s busy timeout; writes go through `ctx.dispatch_tool()` and the `kanban_*` toolset.
 - **`models.py`** — Thread-safe persistent state: `SyncMap` (task_id → thread_id mapping, persisted to `sync_map.json`), `ThreadMetaTracker` (per-thread last-seen message ID, persisted to `thread_meta.json`), `SyncState` (in-memory runtime counters).
 
 ### Data flow
@@ -73,8 +73,8 @@ Discord Developer Portal でボットに付与が必要な権限:
 4. `last_event_id` advances to `MAX(task_events.id)` after each cycle.
 
 **Discord → Kanban (Phase 2):**
-- **Comments**: New thread messages (non-bot) → `KanbanBridge.add_comment()`. Uses `ThreadMetaTracker` to track the last processed message ID per thread.
-- **Tag changes**: `applied_tags` on each thread → reverse-lookup in `_tag_map` → `KanbanBridge.update_task_status()`. Writes `source: "forum_tag_sync"` to the event payload to identify origin (but does not use this to skip re-processing—be careful of potential loops if status update triggers another tag change).
+- **Comments**: New thread messages (non-bot) → `KanbanBridge.add_comment()` → `kanban_comment`. Uses `ThreadMetaTracker` to track the last durably processed message ID per thread.
+- **Tag changes**: `applied_tags` on each thread → reverse-lookup in `_tag_map` → `KanbanBridge.update_task_status()`. Only semantic tool transitions are applied (`kanban_block`, `kanban_complete`, `kanban_unblock`); unsupported arbitrary status edits are skipped rather than written directly to SQLite.
 
 ### Forum channel auto-resolution order
 
@@ -106,13 +106,13 @@ Hermes has a `kanban_notify_subs` table for push notifications (`task_id`, `plat
 The `tasks` table has many additional columns not queried by this plugin. From `kanban_db.py` DDL: `created_by`, `started_at`, `workspace_kind`, `workspace_path`, `branch_name`, `claim_lock`, `claim_expires`, `tenant`, `result`, `idempotency_key`, `consecutive_failures`, `worker_pid`, `last_failure_error`, `max_runtime_seconds`, `last_heartbeat_at`, `current_run_id`, `workflow_template_id`, `current_step_key`, `skills`, `model_override`, `max_retries`, `session_id`. Note: the official docs listed `workspace` and `scheduled_at` which do not exist; the actual column names are `workspace_kind`/`workspace_path` and `started_at`. The DB runs in **WAL mode**, making concurrent reads safe without extra configuration.
 
 **Official task statuses (7 total):** `triage`, `todo`, `ready`, `running`, `blocked`, `done`, `archived`.  
-The plugin's `STATUS_TO_TAG` and `TAG_TO_STATUS` include `scheduled` and `review`, which are **not** official Kanban statuses. `TAG_TO_STATUS` also includes `"Backlog": "backlog"`, another non-standard status. These mappings will silently no-op if those statuses never appear in the DB, but any task assigned a non-standard status won't get a matching Forum tag.
+Forum-only tags are normalized before any Kanban write: `Backlog` → `triage`, `Scheduled` → `ready`, and `Review` → `running`. The bridge refuses non-standard statuses.
 
 **Multi-board DB path:** Default is `~/.hermes/kanban.db`, but per-board DBs live at `~/.hermes/kanban/boards/<slug>/kanban.db`. `KanbanBridge` hardcodes the default path (`KANBAN_DB_PATH` constant in `kanban_bridge.py`) and accepts `db_path` as a constructor argument, but `__init__.py` never passes it — there is no env var override. Supporting non-default boards requires wiring an env var (e.g. `FORUM_SYNC_DB_PATH`) through `_get_syncer()` → `KanbanForumSyncer` → `KanbanBridge`.
 
 **Event-driven mode (inotify):** `FORUM_SYNC_EVENT_DRIVEN=1` enables `_run_loop_inotify()` which uses Linux inotify to watch `kanban.db` and `kanban.db-wal`. The loop reacts immediately to DB writes instead of sleeping for `POLL_INTERVAL`. `poll_interval` becomes the fallback timeout (runs Phase 2 Discord polling regardless). Implemented in `kanban_watcher.py` via ctypes + select, no extra dependencies. Note: the Hermes source has no `WS /api/plugins/kanban/events` WebSocket endpoint; the "kanban tail" command uses the same DB polling as this plugin.
 
-**Event kinds:** The plugin writes `kind='status_change'` to `task_events`; the official taxonomy uses `kind='status'` for human-driven status edits. These are distinct rows—the plugin's writes won't be misread by Hermes, but they also won't appear under the official `status` event kind in the dashboard.
+**Event kinds:** Discord-origin writes use Kanban tools rather than raw `task_events` inserts, so event kinds come from Hermes core.
 
 ## Design decisions
 

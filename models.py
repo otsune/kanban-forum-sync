@@ -3,12 +3,50 @@
 
 import json
 import os
+import shutil
 import threading
+import time
+import fcntl
 from typing import Optional
 
 _PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 SYNC_MAP_PATH = os.path.join(_PLUGIN_DIR, "sync_map.json")
 THREAD_META_PATH = os.path.join(_PLUGIN_DIR, "thread_meta.json")
+
+
+def _load_json_dict(path: str) -> dict:
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        backup = f"{path}.corrupt.{int(time.time())}"
+        try:
+            shutil.move(path, backup)
+        except OSError:
+            pass
+        return {}
+
+
+def _atomic_save_json(path: str, data: dict, **dump_kwargs) -> None:
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    tmp_path = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}"
+    lock_path = f"{path}.lock"
+    with open(lock_path, "a") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            with open(tmp_path, "w") as f:
+                json.dump(data, f, **dump_kwargs)
+                f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, path)
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 class SyncMap:
@@ -21,14 +59,10 @@ class SyncMap:
         self._load()
 
     def _load(self):
-        if os.path.exists(self._path):
-            with open(self._path) as f:
-                self._data = json.load(f)
+        self._data = _load_json_dict(self._path)
 
     def _save(self):
-        os.makedirs(os.path.dirname(self._path), exist_ok=True)
-        with open(self._path, "w") as f:
-            json.dump(self._data, f, indent=2)
+        _atomic_save_json(self._path, self._data, indent=2)
 
     def get(self, kanban_id: str) -> Optional[int]:
         with self._lock:
@@ -88,14 +122,10 @@ class SyncOriginTracker:
         self._load()
 
     def _load(self):
-        if os.path.exists(self._path):
-            with open(self._path) as f:
-                self._data = json.load(f)
+        self._data = _load_json_dict(self._path)
 
     def _save(self):
-        os.makedirs(os.path.dirname(self._path), exist_ok=True)
-        with open(self._path, "w") as f:
-            json.dump(self._data, f, indent=2)
+        _atomic_save_json(self._path, self._data, indent=2)
 
     def set_origin(self, task_id: str, origin: str):
         with self._lock:
@@ -144,14 +174,10 @@ class ThreadMetaTracker:
         self._load()
 
     def _load(self):
-        if os.path.exists(self._path):
-            with open(self._path) as f:
-                self._data = json.load(f)
+        self._data = _load_json_dict(self._path)
 
     def _save(self):
-        os.makedirs(os.path.dirname(self._path), exist_ok=True)
-        with open(self._path, "w") as f:
-            json.dump(self._data, f, indent=2, sort_keys=True)
+        _atomic_save_json(self._path, self._data, indent=2, sort_keys=True)
 
     def get_last_message_id(self, thread_id: int) -> int:
         """追跡しているスレッドの最後に処理したメッセージID"""

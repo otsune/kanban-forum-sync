@@ -1,10 +1,9 @@
-"""Kanban SQLite DB の読み取り・書き込みモジュール。
-実DBスキーマ（task_events ベースの変更検出）に合わせた実装。"""
+"""Kanban 読み取り・toolset 書き込みモジュール。
+読み取りは SQLite、書き込みは Hermes の kanban_* tools 経由で行う。"""
 
 import sqlite3
 import os
 import json
-import time
 import logging
 from typing import Optional
 
@@ -13,17 +12,20 @@ logger = logging.getLogger(__name__)
 KANBAN_DB_PATH = os.path.expanduser("~/.hermes/kanban.db")
 
 TASK_COLS = "id, title, body, status, priority, assignee, created_at, completed_at"
+KANBAN_STATUSES = {"triage", "todo", "ready", "running", "blocked", "done", "archived"}
 
 
 class KanbanBridge:
     """Kanban DB への読み書きブリッジ"""
 
-    def __init__(self, db_path: str = KANBAN_DB_PATH):
+    def __init__(self, db_path: str = KANBAN_DB_PATH, ctx=None):
         self.db_path = db_path
+        self.ctx = ctx
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=120)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=120000")
         return conn
 
     # ---- 読み取り ----
@@ -115,7 +117,27 @@ class KanbanBridge:
         finally:
             conn.close()
 
-    # ---- 書き込み（Phase 2 + Phase 3: 新規タスク作成含む） ----
+    # ---- 書き込み（Kanban toolset 経由） ----
+
+    def _dispatch_kanban_tool(self, tool_name: str, args: dict) -> Optional[dict]:
+        if self.ctx is None:
+            logger.error("%s requires plugin ctx.dispatch_tool; write skipped", tool_name)
+            return None
+
+        try:
+            raw = self.ctx.dispatch_tool(tool_name, args)
+            result = json.loads(raw) if isinstance(raw, str) else raw
+        except Exception as e:
+            logger.error("%s dispatch failed: %s", tool_name, e)
+            return None
+
+        if not isinstance(result, dict):
+            logger.error("%s returned non-object result: %r", tool_name, result)
+            return None
+        if result.get("error"):
+            logger.error("%s failed: %s", tool_name, result["error"])
+            return None
+        return result
 
     def create_task(self, title: str, body: str = "",
                     status: str = "triage",
@@ -128,115 +150,97 @@ class KanbanBridge:
         if not title or not title.strip():
             logger.error("create_task: title is required")
             return None
-        import uuid
-        task_id = f"t_{uuid.uuid4().hex[:8]}"
-        now = int(time.time())
-        conn = self._connect()
-        try:
-            conn.execute(
-                "INSERT INTO tasks "
-                "(id, title, body, assignee, status, priority, created_at) "
-                "VALUES (?, ?, ?, ?, ?, 0, ?)",
-                (task_id, title.strip(), body, assignee, status, now),
-            )
-            payload = json.dumps({
-                "title": title.strip(),
-                "status": status,
-                "source": "forum_thread_sync",
-            })
-            conn.execute(
-                "INSERT INTO task_events (task_id, kind, payload, created_at) "
-                "VALUES (?, 'created', ?, ?)",
-                (task_id, payload, now),
-            )
-            conn.commit()
-            logger.info("Created task-%s from forum thread: %s", task_id, title)
-            return task_id
-        except Exception as e:
-            logger.error("Failed to create task from forum thread: %s", e)
-            return None
-        finally:
-            conn.close()
+        if status not in KANBAN_STATUSES:
+            logger.warning("create_task: unsupported status %r; using triage", status)
+            status = "triage"
 
-    # ---- 書き込み（Phase 2: フィードバック同期用） ----
+        resolved_assignee = (
+            assignee
+            or os.environ.get("FORUM_SYNC_DEFAULT_ASSIGNEE")
+            or os.environ.get("HERMES_PROFILE")
+        )
+        if not resolved_assignee:
+            logger.error(
+                "create_task requires assignee for kanban_create; set "
+                "FORUM_SYNC_DEFAULT_ASSIGNEE"
+            )
+            return None
+
+        args = {
+            "title": title.strip(),
+            "body": body,
+            "assignee": resolved_assignee,
+            "triage": status != "blocked",
+            "initial_status": "blocked" if status == "blocked" else "running",
+        }
+        result = self._dispatch_kanban_tool("kanban_create", args)
+        task_id = result.get("task_id") if result else None
+        if task_id:
+            logger.info("Created task-%s from forum thread: %s", task_id, title)
+            return str(task_id)
+        return None
 
     def add_comment(self, task_id: str, author: str, body: str) -> bool:
-        """タスクにコメントを追加（コメント＋イベント）"""
-        conn = self._connect()
-        try:
-            now = int(time.time())
-            cursor = conn.execute(
-                "INSERT INTO task_comments (task_id, author, body, created_at) "
-                "VALUES (?, ?, ?, ?)",
-                (task_id, author, body, now),
-            )
-            conn.execute(
-                "INSERT INTO task_events (task_id, kind, payload, created_at) "
-                "VALUES (?, 'commented', ?, ?)",
-                (task_id, json.dumps({"comment_id": cursor.lastrowid}), now),
-            )
-            conn.commit()
+        """タスクにコメントを追加"""
+        comment_body = f"**Discord: {author}**\n{body}"
+        result = self._dispatch_kanban_tool(
+            "kanban_comment",
+            {"task_id": task_id, "body": comment_body},
+        )
+        if result:
             logger.info("Added comment to task-%s by %s", task_id, author)
             return True
-        except Exception as e:
-            logger.error("Failed to add comment to task %s: %s", task_id, e)
-            return False
-        finally:
-            conn.close()
+        return False
 
     def record_event(self, task_id: str, kind: str,
                      payload: Optional[str] = None) -> bool:
-        """タスクイベントを記録"""
-        conn = self._connect()
-        try:
-            now = int(time.time())
-            conn.execute(
-                "INSERT INTO task_events (task_id, kind, payload, created_at) "
-                "VALUES (?, ?, ?, ?)",
-                (task_id, kind, payload, now),
-            )
-            conn.commit()
-            return True
-        except Exception as e:
-            logger.error("Failed to record event for task %s: %s", task_id, e)
-            return False
-        finally:
-            conn.close()
+        """任意イベントは Kanban toolset に存在しないためコメントとして記録する。"""
+        body = f"Forum sync event: {kind}"
+        if payload:
+            body = f"{body}\n\n```json\n{payload}\n```"
+        return self.add_comment(task_id, "forum-sync", body)
 
     def update_task_status(self, task_id: str, new_status: str) -> bool:
-        """タスクのステータスを更新し、イベントを記録"""
-        conn = self._connect()
-        try:
-            row = conn.execute(
-                "SELECT status FROM tasks WHERE id = ?", (task_id,)
-            ).fetchone()
-            if not row:
-                logger.warning("Task %s not found", task_id)
-                return False
-            old_status = row["status"]
-            if old_status == new_status:
-                return True
+        """Kanban toolset で表現できる範囲でステータスを更新する。"""
+        if new_status not in KANBAN_STATUSES:
+            logger.warning("Refusing unsupported status %r for task %s", new_status, task_id)
+            return False
 
-            now = int(time.time())
-            conn.execute(
-                "UPDATE tasks SET status = ? WHERE id = ?",
-                (new_status, task_id),
+        current = self.get_task(task_id)
+        if not current:
+            logger.warning("Task %s not found", task_id)
+            return False
+        old_status = current["status"]
+        if old_status == new_status:
+            return True
+
+        if new_status == "blocked":
+            result = self._dispatch_kanban_tool(
+                "kanban_block",
+                {"task_id": task_id, "reason": "Blocked from Discord forum tag"},
             )
-            payload = json.dumps({"from": old_status, "to": new_status,
-                                   "source": "forum_tag_sync"})
-            conn.execute(
-                "INSERT INTO task_events (task_id, kind, payload, created_at) "
-                "VALUES (?, 'status_change', ?, ?)",
-                (task_id, payload, now),
+        elif new_status == "done":
+            result = self._dispatch_kanban_tool(
+                "kanban_complete",
+                {
+                    "task_id": task_id,
+                    "summary": "Marked done from Discord forum tag",
+                    "metadata": {"source": "forum_tag_sync", "from": old_status},
+                },
             )
-            conn.commit()
+        elif new_status == "ready" and old_status == "blocked":
+            result = self._dispatch_kanban_tool("kanban_unblock", {"task_id": task_id})
+        else:
+            logger.warning(
+                "No Kanban tool can transition task-%s from %s to %s; skipped",
+                task_id, old_status, new_status,
+            )
+            return False
+
+        if result:
             logger.info(
                 "Task-%s status updated: %s → %s (from forum tag)",
                 task_id, old_status, new_status,
             )
             return True
-        except Exception as e:
-            logger.error("Failed to update task %s: %s", task_id, e)
-            return False
-        finally:
-            conn.close()
+        return False

@@ -32,7 +32,7 @@ class DiscordForumError(RuntimeError):
         self.body = body
 
 
-class PermissionError(DiscordForumError):
+class DiscordPermissionError(DiscordForumError):
     """Bot に権限がない場合のエラー（HTTP 403）"""
     pass
 
@@ -84,7 +84,7 @@ class DiscordForumClient:
                     time.sleep(retry_after)
                     continue
                 if e.code == 403:
-                    raise PermissionError(
+                    raise DiscordPermissionError(
                         "Bot lacks permission: %s" % error_body,
                         http_code=403, body=error_body
                     )
