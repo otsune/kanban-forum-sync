@@ -902,11 +902,15 @@ class KanbanForumSyncer:
                     self._state.last_error = str(e)
 
     def full_sync(self):
-        """手動フル同期（CLI/スラッシュコマンド用）"""
+        """手動フル同期（CLI/スラッシュコマンド用）
+
+        sync_map は消さずに initial_sync() を呼ぶ。既存マッピングがあるタスクは
+        update パスで処理されるため Discord に重複スレッドを作らない。
+        404 になったスレッドは _sync_task_to_forum() 内の NotFoundError ハンドラが
+        sync_map から除去して自動再作成する。
+        """
         if not self._resolve_forum_channel():
             return
         self._ensure_tags()
         self._build_tag_map()
-        self._sync_map.clear()
-        self._origin_tracker.clear()
         self.initial_sync()
