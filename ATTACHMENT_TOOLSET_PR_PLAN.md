@@ -9,7 +9,7 @@ The Kanban board already has full attachment **storage**:
 - DB table `task_attachments(id, task_id, filename, stored_path, content_type, size, uploaded_by, created_at)` — `hermes_cli/kanban_db.py`.
 - Module helpers in `hermes_cli/kanban_db.py`:
   - `attachments_root(board)` / `task_attachments_dir(task_id, board)` — resolve the on-disk dir.
-  - `add_attachment(conn, task_id, filename, stored_path, content_type=None, size=0, uploaded_by=None) -> int` (line ~2460) — inserts the metadata row; **caller writes the blob to `stored_path` first**.
+  - `add_attachment(conn, task_id, *, filename, stored_path, content_type=None, size=0, uploaded_by=None) -> int` (line ~2460; **keyword-only** args after `task_id`) — inserts the metadata row and appends an `attached` event; **caller writes the blob to `stored_path` first**.
   - `list_attachments(conn, task_id)`, `get_attachment(conn, id)`, `delete_attachment(conn, id)`.
 - A **dashboard HTTP API** already exposes upload/list/download/delete: `plugins/kanban/dashboard/plugin_api.py`
   - `POST /tasks/{task_id}/attachments` (multipart `file` + optional `uploaded_by`, 25 MB cap), `GET .../attachments`, `GET /attachments/{id}`, `DELETE /attachments/{id}`.
