@@ -660,6 +660,15 @@ class KanbanForumSyncer:
                         posted += 1
                         time.sleep(0.5)
                     self._thread_meta.set_last_kanban_event_id(thread_id, ev["id"])
+                except NotFoundError:
+                    logger.warning(
+                        "Thread %s not found while posting event %s; removing stale mapping",
+                        thread_id, ev["id"],
+                    )
+                    stale_task_id = self._sync_map.get_by_thread_id(thread_id)
+                    if stale_task_id:
+                        self._sync_map.remove(stale_task_id)
+                    break
                 except Exception as e:
                     logger.warning(
                         "Failed to post event %s to thread %s: %s",
@@ -736,6 +745,15 @@ class KanbanForumSyncer:
                 self.discord.update_thread(thread_id, **kwargs)
                 logger.info("Updated thread for task-%s", task_id)
                 return True
+        except NotFoundError:
+            # スレッドが Discord 上に存在しない → sync_map から除去して再作成を促す
+            logger.warning(
+                "Thread %s for task-%s not found; removing stale mapping and re-creating",
+                thread_id, task_id,
+            )
+            self._sync_map.remove(task_id)
+            # 再帰呼び出しで create パスに進む（thread_id=None になるため）
+            return self._sync_task_to_forum(task)
         except Exception as e:
             logger.error("Failed to sync task-%s: %s", task_id, e)
             return False
