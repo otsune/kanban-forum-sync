@@ -87,6 +87,10 @@ _WORKER_LOG_KINDS = [
     "protocol_violation", "linked",
 ]
 
+# kanban_attach_url のサーバー側取得上限（25MB）。超過ファイルは取り込まず
+# Discord URL をコメントとして残してリンクを保持する。
+_MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024  # 25 MB
+
 
 def _normalize_kanban_status(status: str) -> Optional[str]:
     status = _STATUS_ALIASES.get(status, status)
@@ -387,6 +391,36 @@ class KanbanForumSyncer:
                 logger.warning("Failed to get bot user ID: %s", e)
         return self._bot_user_id
 
+    def _sync_attachment(self, task_id: str, author_name: str, att: dict) -> bool:
+        """Discord メッセージの添付ファイル1件を Kanban の attachment に同期する。
+
+        kanban_attach_url にサーバー側で URL を取得させる（上限25MB）。
+        25MB 超過ファイルは取り込まず Discord URL をコメントとして残す。
+        成功で True、一時的失敗で False（カーソルを進めず次サイクルで再試行）。
+        """
+        filename = att.get("filename", "file")
+        url = att.get("url", "")
+        content_type = att.get("content_type")
+        size = att.get("size", 0)
+
+        if not url:
+            logger.warning("Attachment '%s' has no url; skipping", filename)
+            return True  # 取りようがないのでカーソルは進める
+
+        if size and size > _MAX_ATTACHMENT_BYTES:
+            logger.info(
+                "Attachment '%s' (%d bytes) exceeds %d limit; posting url as comment",
+                filename, size, _MAX_ATTACHMENT_BYTES,
+            )
+            return self.kanban.add_comment(
+                task_id, author_name,
+                f"📎 添付ファイル（サイズ上限超過のため未取込）: {filename}\n{url}",
+            )
+
+        return self.kanban.attach_url(
+            task_id, url, content_type=content_type, title=filename,
+        )
+
     def _sync_forum_comments(self):
         """Forum スレッドの新規メッセージを検出し、Kanban コメントとして追加する。"""
         sync_items = self._sync_map.items()
@@ -435,22 +469,35 @@ class KanbanForumSyncer:
                     continue
 
                 content = msg.get("content", "").strip()
-                if content:
+                attachments = msg.get("attachments", []) or []
+
+                msg_ok = True
+
+                # 添付ファイルを先に同期
+                for att in attachments:
+                    if not self._sync_attachment(task_id, author_name, att):
+                        msg_ok = False
+                        break
+
+                # テキスト本文を同期
+                if msg_ok and content:
                     if self.kanban.add_comment(task_id, author_name, content):
                         new_comments += 1
-                        max_processed_id = max(max_processed_id, msg_id)
                         logger.debug(
                             "Comment synced: %s → task-%s", author_name, task_id
                         )
                     else:
-                        logger.warning(
-                            "Comment sync failed for thread %s message %s; "
-                            "cursor left at %s for retry",
-                            thread_id, msg_id, max_processed_id,
-                        )
-                        break
-                else:
+                        msg_ok = False
+
+                if msg_ok:
                     max_processed_id = max(max_processed_id, msg_id)
+                else:
+                    logger.warning(
+                        "Message sync failed for thread %s message %s; "
+                        "cursor left at %s for retry",
+                        thread_id, msg_id, max_processed_id,
+                    )
+                    break
 
             if max_processed_id > last_id:
                 self._thread_meta.set_last_message_id(thread_id, max_processed_id)

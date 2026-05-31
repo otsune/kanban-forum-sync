@@ -74,6 +74,7 @@ Discord Developer Portal でボットに付与が必要な権限:
 
 **Discord → Kanban (Phase 2):**
 - **Comments**: New thread messages (non-bot) → `KanbanBridge.add_comment()` → `kanban_comment`. Uses `ThreadMetaTracker` to track the last durably processed message ID per thread.
+- **Attachments**: Files on a thread message (non-bot) → `KanbanBridge.attach_url()` → `kanban_attach_url`, which makes the Kanban server fetch the Discord CDN URL itself and store it under the kanban data dir (`task_attachments.stored_path`). The tool caps files at 25 MB; files whose reported `size` exceeds `_MAX_ATTACHMENT_BYTES` (25 MB) are not fetched — instead their Discord URL is posted as a `kanban_comment` so the link isn't lost. Attachments share the per-message `last_message_id` cursor with comments — a message advances the cursor only after all its attachments **and** its text body sync successfully (at-least-once; a partial failure re-runs the whole message next cycle). Discord CDN URLs are signed/expiring but the server fetch happens within the same sync cycle, so they're still valid.
 - **Tag changes**: `applied_tags` on each thread → reverse-lookup in `_tag_map` → `KanbanBridge.update_task_status()`. Only semantic tool transitions are applied (`kanban_block`, `kanban_complete`, `kanban_unblock`); unsupported arbitrary status edits are skipped rather than written directly to SQLite.
 
 ### Forum channel auto-resolution order
