@@ -551,6 +551,16 @@ class KanbanForumSyncer:
                 task_id, existing, thread_id,
             )
             return False
+        # スレッドが実際に Discord 上でアクセス可能か確認してからリンクする
+        try:
+            self.discord.get_channel_by_id(thread_id)
+        except Exception as e:
+            if "Resource not found" in str(e):
+                logger.debug(
+                    "Orphan recovery: thread %s returns 404; skipping (may be deleted)",
+                    thread_id,
+                )
+                return False
         self._sync_map.set(task_id, thread_id)
         logger.info(
             "Orphan recovery: re-linked thread %s → task-%s ('%s')",
