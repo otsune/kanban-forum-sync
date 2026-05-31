@@ -79,7 +79,13 @@ STATUS_TO_TAG, TAG_TO_STATUS, STATUS_TAG_EMOJI = _build_tag_tables(_LANG)
 ARCHIVE_STATUSES = {"done", "archived"}
 
 # task_events の種別のうち Discord に通知するもの
-_WORKER_LOG_KINDS = ["blocked", "spawned"]
+_WORKER_LOG_KINDS = [
+    "blocked", "unblocked",
+    "spawned", "claimed", "reclaimed",
+    "completed", "gave_up",
+    "status_change", "promoted", "archived", "stale",
+    "protocol_violation", "linked",
+]
 
 
 def _normalize_kanban_status(status: str) -> Optional[str]:
@@ -95,12 +101,52 @@ def _format_worker_event(ev: dict) -> str:
             payload = json.loads(ev["payload"])
         except Exception:
             pass
+
     if kind == "blocked":
         reason = payload.get("reason", "")
         return f"🚧 **Blocked**: {reason}" if reason else "🚧 **Blocked**"
+    if kind == "unblocked":
+        return "✅ **Unblocked**"
     if kind == "spawned":
         pid = payload.get("pid", "?")
         return f"🤖 **Worker spawned** (PID {pid})"
+    if kind == "claimed":
+        run_id = payload.get("run_id", "?")
+        return f"🔒 **Worker claimed** (run #{run_id})"
+    if kind == "reclaimed":
+        return "🔄 **Reclaimed** — previous worker expired"
+    if kind == "completed":
+        summary = payload.get("summary", "")
+        return f"🎉 **Completed**\n{summary}" if summary else "🎉 **Completed**"
+    if kind == "gave_up":
+        error = payload.get("error", "")
+        failures = payload.get("failures", "?")
+        base = f"❌ **Failed** (attempt {failures})"
+        return f"{base}\n{error}" if error else base
+    if kind == "status_change":
+        # forum_tag_sync 由来は Discord 側の操作が起源なので重複投稿しない
+        if payload.get("source") == "forum_tag_sync":
+            return ""
+        from_s = payload.get("from", "?")
+        to_s = payload.get("to", "?")
+        source = payload.get("source", "")
+        suffix = f" (via {source})" if source else ""
+        return f"📊 **Status**: {from_s} → {to_s}{suffix}"
+    if kind == "promoted":
+        return "⬆️ **Promoted**"
+    if kind == "archived":
+        return "📦 **Archived**"
+    if kind == "stale":
+        elapsed = payload.get("elapsed_seconds")
+        if elapsed:
+            return f"💤 **Stale** — no activity for {elapsed // 3600}h"
+        return "💤 **Stale**"
+    if kind == "protocol_violation":
+        exit_code = payload.get("exit_code", "?")
+        return f"⚠️ **Protocol violation** (exit code {exit_code})"
+    if kind == "linked":
+        target = payload.get("target_id", "")
+        return f"🔗 **Linked** → task-{target}" if target else "🔗 **Linked**"
     return ""
 
 _FORUM_GUIDE_URL = "https://support.discord.com/hc/ja/articles/6208479917079"
