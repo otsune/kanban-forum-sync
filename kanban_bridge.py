@@ -192,25 +192,6 @@ class KanbanBridge:
             return True
         return False
 
-    def attach_url(self, task_id: str, url: str,
-                   content_type: Optional[str] = None,
-                   title: Optional[str] = None) -> bool:
-        """添付ファイルを URL 経由で追加（kanban_attach_url ツール経由）。
-
-        Kanban サーバー側が url を取得して task_attachments に保存する（上限25MB）。
-        Discord CDN の署名付き URL は即時取得なら有効。
-        """
-        args: dict = {"task_id": task_id, "url": url}
-        if content_type:
-            args["content_type"] = content_type
-        if title:
-            args["title"] = title
-        result = self._dispatch_kanban_tool("kanban_attach_url", args)
-        if result:
-            logger.info("Attached url '%s' to task-%s", title or url, task_id)
-            return True
-        return False
-
     def record_event(self, task_id: str, kind: str,
                      payload: Optional[str] = None) -> bool:
         """任意イベントは Kanban toolset に存在しないためコメントとして記録する。"""
