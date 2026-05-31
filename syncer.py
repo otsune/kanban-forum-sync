@@ -404,14 +404,14 @@ class KanbanForumSyncer:
                 messages = self.discord.get_thread_messages(
                     thread_id, after=after_param, limit=50
                 )
-            except NotFoundError:
-                logger.warning("Thread %s no longer exists; removing from sync_map", thread_id)
-                stale_task_id = self._sync_map.get_by_thread_id(thread_id)
-                if stale_task_id:
-                    self._sync_map.remove(stale_task_id)
-                continue
             except Exception as e:
-                logger.warning("Failed to fetch messages for thread %s: %s", thread_id, e)
+                if "Resource not found" in str(e):
+                    logger.warning("Thread %s no longer exists; removing from sync_map", thread_id)
+                    stale_task_id = self._sync_map.get_by_thread_id(thread_id)
+                    if stale_task_id:
+                        self._sync_map.remove(stale_task_id)
+                else:
+                    logger.warning("Failed to fetch messages for thread %s: %s", thread_id, e)
                 continue
 
             if not messages:
@@ -471,14 +471,14 @@ class KanbanForumSyncer:
         for task_id, thread_id in sync_items.items():
             try:
                 thread = self.discord.get_channel_by_id(thread_id)
-            except NotFoundError:
-                logger.warning("Thread %s no longer exists; removing from sync_map", thread_id)
-                stale_task_id = self._sync_map.get_by_thread_id(thread_id)
-                if stale_task_id:
-                    self._sync_map.remove(stale_task_id)
-                continue
             except Exception as e:
-                logger.warning("Failed to fetch thread %s: %s", thread_id, e)
+                if "Resource not found" in str(e):
+                    logger.warning("Thread %s no longer exists; removing from sync_map", thread_id)
+                    stale_task_id = self._sync_map.get_by_thread_id(thread_id)
+                    if stale_task_id:
+                        self._sync_map.remove(stale_task_id)
+                else:
+                    logger.warning("Failed to fetch thread %s: %s", thread_id, e)
                 continue
 
             applied = thread.get("applied_tags", [])
@@ -544,9 +544,10 @@ class KanbanForumSyncer:
             )
             return False
         existing = self._sync_map.get(task_id)
-        if existing is not None and existing != thread_id:
+        if existing is not None and existing > thread_id:
+            # 既存マッピングの方がスノーフレーク ID が大きい（新しい）→ 保持する
             logger.debug(
-                "Orphan recovery: task-%s already mapped to thread %s; skipping thread %s",
+                "Orphan recovery: task-%s has newer thread %s; skipping older thread %s",
                 task_id, existing, thread_id,
             )
             return False
@@ -684,10 +685,13 @@ class KanbanForumSyncer:
                     posted += 1
                     time.sleep(0.5)
                 except Exception as e:
-                    logger.warning(
-                        "Failed to post comment %s to thread %s: %s",
-                        c["id"], thread_id, e,
-                    )
+                    if "Resource not found" in str(e):
+                        logger.warning("Thread %s not found while posting comment; removing stale mapping", thread_id)
+                        stale_task_id = self._sync_map.get_by_thread_id(thread_id)
+                        if stale_task_id:
+                            self._sync_map.remove(stale_task_id)
+                    else:
+                        logger.warning("Failed to post comment %s to thread %s: %s", c["id"], thread_id, e)
                     break
 
             # --- ワーカーログ ---
@@ -706,20 +710,17 @@ class KanbanForumSyncer:
                         posted += 1
                         time.sleep(0.5)
                     self._thread_meta.set_last_kanban_event_id(thread_id, ev["id"])
-                except NotFoundError:
-                    logger.warning(
-                        "Thread %s not found while posting event %s; removing stale mapping",
-                        thread_id, ev["id"],
-                    )
-                    stale_task_id = self._sync_map.get_by_thread_id(thread_id)
-                    if stale_task_id:
-                        self._sync_map.remove(stale_task_id)
-                    break
                 except Exception as e:
-                    logger.warning(
-                        "Failed to post event %s to thread %s: %s",
-                        ev["id"], thread_id, e,
-                    )
+                    if "Resource not found" in str(e):
+                        logger.warning(
+                            "Thread %s not found while posting event %s; removing stale mapping",
+                            thread_id, ev["id"],
+                        )
+                        stale_task_id = self._sync_map.get_by_thread_id(thread_id)
+                        if stale_task_id:
+                            self._sync_map.remove(stale_task_id)
+                    else:
+                        logger.warning("Failed to post event %s to thread %s: %s", ev["id"], thread_id, e)
                     break
 
         if posted:
