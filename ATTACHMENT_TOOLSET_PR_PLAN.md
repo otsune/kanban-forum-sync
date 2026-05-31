@@ -88,6 +88,37 @@ Then the dashboard endpoint, the new tools, and the new CLI commands all call th
 - `hermes kanban attach` works from the shell.
 - 25 MB cap enforced uniformly across dashboard + tool + CLI (single shared constant/helper).
 
-## Follow-up in kanban_forum_sync (this repo, after the PR lands)
+## Upstream PR status — track and act on this
 
-Swap `_sync_attachment()` (in `syncer.py`) from the interim `kanban_comment` link back to a real upload via `KanbanBridge` → `kanban_attach_url` (pass the Discord CDN `url`; the server fetches it within the same sync cycle while the signed URL is still valid). Keep the 25 MB pre-check to avoid an infinite retry loop on oversize files (post the URL as a comment for those). See the `_sync_attachment` docstring which already points here.
+This plan has been filed upstream as **[NousResearch/hermes-agent#36019](https://github.com/NousResearch/hermes-agent/pull/36019)** — *"feat(kanban): task attachment toolset + CLI + agent file delivery"*.
+
+**Status (last checked 2026-06-01): OPEN, mergeable, not yet merged.**
+
+Re-check before changing the interim implementation:
+
+```bash
+gh pr view 36019 --repo NousResearch/hermes-agent --json state,mergedAt,title
+```
+
+The actual tool surface the PR adds (use these exact names/args when migrating):
+
+| Tool | Args | Notes |
+|---|---|---|
+| `kanban_attach` | `task_id`, `filename`, `content_base64`, `content_type?` | inline upload, 25 MB cap |
+| `kanban_attach_url` | `task_id`, `url`, `content_type?`, `filename?` | server-side fetch-by-URL, 25 MB cap |
+| `kanban_list_attachments` | `task_id` | list metadata |
+| `kanban_download_attachment` | `attachment_id` | bytes as base64 |
+| `kanban_delete_attachment` | `attachment_id` | row + blob |
+
+### Migration, conditional on PR #36019 state
+
+- **While OPEN / closed-unmerged** → keep the current interim implementation: `_sync_attachment()` posts the Discord file URL via `kanban_comment`. Do **not** call `kanban_attach*` — those tools don't exist in the installed hermes-agent yet and dispatch will fail (→ cursor stalls → infinite retry). This already bit us once (commit 36ccb63).
+
+- **Once MERGED and present in the installed hermes-agent** (verify the tool is actually registered, not just merged on `main` — the local install may lag; check with `HERMES_KANBAN_TASK=1` or grep `tools/kanban_tools.py` for `name="kanban_attach_url"`):
+  1. Re-add `KanbanBridge.attach_url(task_id, url, content_type=None, filename=None)` → `self._dispatch_kanban_tool("kanban_attach_url", {...})`.
+  2. Swap `_sync_attachment()` in `syncer.py` from the `kanban_comment` fallback to `self.kanban.attach_url(task_id, url, content_type=att.get("content_type"), filename=filename)`. Pass the Discord CDN `url`; the server fetches it within the same sync cycle while the signed URL is still valid.
+  3. Keep a 25 MB pre-check on `att["size"]`: oversize files → still post the URL as a `kanban_comment` (don't let a permanently-too-large file stall the cursor in an infinite retry).
+  4. Update the **Attachments** bullet in `CLAUDE.md` (currently marked "interim") and the `_sync_attachment` docstring to describe the real upload path.
+  5. Verify end-to-end: post a small image to a synced Discord thread → confirm a `task_attachments` row + on-disk blob appear (`kanban_list_attachments` or the dashboard), not just a comment.
+
+The `_sync_attachment` docstring in `syncer.py` points back to this file, so this section is the single source of truth for the swap.

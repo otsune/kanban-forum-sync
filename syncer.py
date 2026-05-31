@@ -398,8 +398,11 @@ class KanbanForumSyncer:
           unblock/link のみ。書き込みは kanban_db.add_attachment の直接DB
           操作しかなく、本プラグインの DB アクセス方針に反する）。
         そのため当面は唯一の実在ツール kanban_comment で URL リンクを残す。
-        添付 toolset/CLI が Hermes 本体に入り次第、本物の取り込みに差し替える。
-        計画: ATTACHMENT_TOOLSET_PR_PLAN.md 参照。
+        添付 toolset/CLI を Hermes 本体に追加する PR を申請済み:
+        https://github.com/NousResearch/hermes-agent/pull/36019
+        これがマージされ installed hermes-agent に入り次第、kanban_attach_url
+        経由の本物の取り込みに差し替える。切替手順は ATTACHMENT_TOOLSET_PR_PLAN.md
+        の "Upstream PR status" 節を参照。
 
         成功で True、一時的失敗で False（カーソルを進めず次サイクルで再試行）。
         """
