@@ -3,6 +3,7 @@ task_events ベースの変更検出でポーリング。"""
 
 import json
 import os
+import re
 import time
 import logging
 from threading import Thread, Event
@@ -357,6 +358,12 @@ class KanbanForumSyncer:
                 messages = self.discord.get_thread_messages(
                     thread_id, after=after_param, limit=50
                 )
+            except NotFoundError:
+                logger.warning("Thread %s no longer exists; removing from sync_map", thread_id)
+                stale_task_id = self._sync_map.get_by_thread_id(thread_id)
+                if stale_task_id:
+                    self._sync_map.remove(stale_task_id)
+                continue
             except Exception as e:
                 logger.warning("Failed to fetch messages for thread %s: %s", thread_id, e)
                 continue
@@ -418,6 +425,12 @@ class KanbanForumSyncer:
         for task_id, thread_id in sync_items.items():
             try:
                 thread = self.discord.get_channel_by_id(thread_id)
+            except NotFoundError:
+                logger.warning("Thread %s no longer exists; removing from sync_map", thread_id)
+                stale_task_id = self._sync_map.get_by_thread_id(thread_id)
+                if stale_task_id:
+                    self._sync_map.remove(stale_task_id)
+                continue
             except Exception as e:
                 logger.warning("Failed to fetch thread %s: %s", thread_id, e)
                 continue
@@ -465,6 +478,39 @@ class KanbanForumSyncer:
 
     # ---- Phase 3: Forum 新規スレッド → Kanban タスク作成 ----
 
+    def _recover_orphaned_thread(self, thread_id: int, thread_name: str) -> bool:
+        """sync_map から消えた bot 作成スレッドを再登録する。
+
+        full_sync() が sync_map.clear() した後に initial_sync() が別スレッドを
+        作り直す場合など、旧スレッドが孤立（orphan）することがある。
+        スレッド名 "task-{task_id}: {title}" から task_id を抽出して Kanban に
+        タスクが存在すれば sync_map に再登録する。
+        """
+        m = re.match(r"task-(t_[0-9a-f]+)\s*:", thread_name, re.IGNORECASE)
+        if not m:
+            return False
+        task_id = m.group(1).lower()
+        task = self.kanban.get_task(task_id)
+        if not task:
+            logger.debug(
+                "Orphan recovery: task-%s not found in Kanban for thread %s; skipping",
+                task_id, thread_id,
+            )
+            return False
+        existing = self._sync_map.get(task_id)
+        if existing is not None and existing != thread_id:
+            logger.debug(
+                "Orphan recovery: task-%s already mapped to thread %s; skipping thread %s",
+                task_id, existing, thread_id,
+            )
+            return False
+        self._sync_map.set(task_id, thread_id)
+        logger.info(
+            "Orphan recovery: re-linked thread %s → task-%s ('%s')",
+            thread_id, task_id, thread_name,
+        )
+        return True
+
     def _sync_forum_new_threads(self):
         """Forum チャンネルに新しく作成されたスレッドを検出し、Kanban タスクを作成する。
 
@@ -475,21 +521,34 @@ class KanbanForumSyncer:
             return
 
         try:
-            threads = self.discord.get_channel_active_threads()
+            guild_id = self.discord.get_current_guild_id()
+            active = self.discord.get_active_threads(guild_id) if guild_id else []
+            # guild レベルで全スレッドを取得し、この forum チャンネルのものだけ絞り込む
+            threads = [t for t in active if str(t.get("parent_id")) == str(self.channel_id)]
         except Exception as e:
             logger.warning("Failed to fetch active threads: %s", e)
-            return
+            threads = []
 
-        if not threads:
+        try:
+            archived = self.discord.get_archived_public_threads()
+        except Exception as e:
+            logger.debug("Failed to fetch archived threads: %s", e)
+            archived = []
+
+        all_threads = list({int(t["id"]): t for t in threads + archived}.values())
+        if not all_threads:
             return
 
         new_count = 0
-        for thread in threads:
+        for thread in all_threads:
             thread_id = int(thread["id"])
             thread_name = thread.get("name", "").strip()
 
-            # Bot が作ったスレッド（task- プレフィックス）はスキップ
+            # Bot が作ったスレッド（task- プレフィックス）は通常スキップ。
+            # ただし sync_map に存在しない場合は orphan 回復を試みる。
             if thread_name.lower().startswith("task-"):
+                if not self._sync_map.contains_thread(thread_id):
+                    self._recover_orphaned_thread(thread_id, thread_name)
                 continue
 
             # すでに同期マップにあるスレッドはスキップ

@@ -238,3 +238,16 @@ class DiscordForumClient:
             "GET", f"/channels/{self.channel_id}/threads/active"
         )
         return result.get("threads", [])
+
+    def get_archived_public_threads(self, limit: int = 50) -> list[dict]:
+        """Forum チャンネルのアーカイブ済み公開スレッド一覧を取得。
+
+        Discord API v10: GET /channels/{channel_id}/threads/archived/public
+        """
+        if self.channel_id is None:
+            raise ValueError("channel_id is not set")
+        result = self._request(
+            "GET",
+            f"/channels/{self.channel_id}/threads/archived/public?limit={limit}",
+        )
+        return result.get("threads", [])
