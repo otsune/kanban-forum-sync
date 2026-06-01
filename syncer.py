@@ -934,7 +934,18 @@ class KanbanForumSyncer:
                 logger.info("Updated thread for task-%s", task_id)
                 return True
         except NotFoundError:
-            # スレッドが Discord 上に存在しない → sync_map から除去
+            # create パス（thread_id is None）での 404 は「親 Forum チャンネルが
+            # 消えている」ことを意味する。スレッドではなく Forum 自体の問題なので
+            # 再帰してはいけない（無限再帰 → RecursionError になる）。Forum の
+            # 復旧は incremental_sync 冒頭の _ensure_channel_alive に任せる。
+            if thread_id is None:
+                logger.warning(
+                    "create_thread 404 for task-%s — Forum channel likely deleted; "
+                    "skipping this cycle (channel self-heal will handle it).",
+                    task_id,
+                )
+                return False
+            # ここから先は update パスでの 404 = スレッドだけが削除されたケース。
             self._sync_map.remove(task_id)
             # アーカイブ済み/完了タスクは再作成しない（ユーザーが意図的に削除した
             # 終了済みスレッドを作り直さない）。アクティブなタスクのみ再作成する。
@@ -949,7 +960,8 @@ class KanbanForumSyncer:
                 "Thread %s for task-%s not found; removing stale mapping and re-creating",
                 thread_id, task_id,
             )
-            # 再帰呼び出しで create パスに進む（thread_id=None になるため）
+            # 再帰は1段のみ（thread_id=None の create パスに進む）。create が再び
+            # 404 を返しても上の `if thread_id is None` で止まるため無限再帰しない。
             return self._sync_task_to_forum(task)
         except Exception as e:
             logger.error("Failed to sync task-%s: %s", task_id, e)
