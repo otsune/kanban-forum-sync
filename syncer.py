@@ -849,6 +849,15 @@ class KanbanForumSyncer:
 
         try:
             if thread_id is None:
+                # アーカイブ済み/完了タスクには新スレッドを作らない。
+                # 既に終わったタスク（特にユーザーが Discord 側で削除した
+                # スレッド）を毎回作り直してしまう不具合を防ぐ。スレッドを持つ
+                # まま done/archived になったタスクは update パスでアーカイブされる。
+                if task["status"] in ARCHIVE_STATUSES:
+                    logger.debug(
+                        "Skipping thread creation for archived/done task-%s", task_id
+                    )
+                    return True
                 tag_ids = self._resolve_tag_ids(task["status"])
                 result = self.discord.create_thread(
                     name=self._thread_title(task),
@@ -886,12 +895,21 @@ class KanbanForumSyncer:
                 logger.info("Updated thread for task-%s", task_id)
                 return True
         except NotFoundError:
-            # スレッドが Discord 上に存在しない → sync_map から除去して再作成を促す
+            # スレッドが Discord 上に存在しない → sync_map から除去
+            self._sync_map.remove(task_id)
+            # アーカイブ済み/完了タスクは再作成しない（ユーザーが意図的に削除した
+            # 終了済みスレッドを作り直さない）。アクティブなタスクのみ再作成する。
+            if task["status"] in ARCHIVE_STATUSES:
+                logger.info(
+                    "Thread %s for archived/done task-%s not found; "
+                    "removing stale mapping without re-creating",
+                    thread_id, task_id,
+                )
+                return True
             logger.warning(
                 "Thread %s for task-%s not found; removing stale mapping and re-creating",
                 thread_id, task_id,
             )
-            self._sync_map.remove(task_id)
             # 再帰呼び出しで create パスに進む（thread_id=None になるため）
             return self._sync_task_to_forum(task)
         except Exception as e:
