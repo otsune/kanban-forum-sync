@@ -199,6 +199,12 @@ class ThreadMetaTracker:
             self._data.pop(str(thread_id), None)
             self._save()
 
+    def clear(self):
+        """全メタデータを破棄（Forum チャンネル削除からの復旧時など）"""
+        with self._lock:
+            self._data.clear()
+            self._save()
+
     def get_last_comment_id(self, thread_id: int) -> int:
         """Kanban→Discord で最後に投稿したコメントID"""
         with self._lock:

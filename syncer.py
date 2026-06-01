@@ -314,6 +314,7 @@ class KanbanForumSyncer:
         Returns: True=解決成功, False=解決失敗
         """
         guild_id = None
+        recovering_from_deletion = False
 
         if self._channel_id is not None:
             try:
@@ -329,7 +330,23 @@ class KanbanForumSyncer:
                     "Channel #%s is type=%s (not forum). Searching guild %s...",
                     channel["name"], channel.get("type"), guild_id,
                 )
-            except (NotFoundError, DiscordForumError) as e:
+            except NotFoundError:
+                # 設定済みチャンネルが Discord 側で削除された（404）→ abort せず
+                # 自動復旧する: ギルドを再スキャンして既存 forum を探し、無ければ再生成。
+                # 削除されたチャンネルから guild_id は取れないため、channel_id 未設定
+                # 扱いにして全ギルド探索パスへフォールスルーする。
+                logger.warning(
+                    "Configured forum channel %s no longer exists on Discord "
+                    "(deleted). Auto-recovering: will rediscover or recreate. "
+                    "Update FORUM_SYNC_CHANNEL_ID to the new channel afterwards.",
+                    self._channel_id,
+                )
+                recovering_from_deletion = True
+                self._channel_id = None
+                self.discord.channel_id = None
+                # guild_id は None のまま → 下の全ギルド探索へ
+            except DiscordForumError as e:
+                # 一時的・権限エラーなどは再生成しない（forum 重複生成を避ける）。
                 logger.warning(
                     "Configured channel %s not accessible: %s", self._channel_id, e
                 )
@@ -362,6 +379,8 @@ class KanbanForumSyncer:
                         "Found forum #%s (%s) in guild '%s'",
                         existing["name"], existing["id"], g["name"],
                     )
+                    if recovering_from_deletion:
+                        self._reset_state_after_forum_recovery(int(existing["id"]))
                     return True
 
             if not guilds:
@@ -377,7 +396,27 @@ class KanbanForumSyncer:
                 "No forum found. Attempting to create in '%s'...", guilds[0]["name"]
             )
 
-        return self._find_or_create_forum_in_guild(guild_id)
+        ok = self._find_or_create_forum_in_guild(guild_id)
+        if ok and recovering_from_deletion and self._channel_id is not None:
+            self._reset_state_after_forum_recovery(self._channel_id)
+        return ok
+
+    def _reset_state_after_forum_recovery(self, new_channel_id: int) -> None:
+        """削除された Forum から復旧した直後の後始末。
+
+        旧 Forum チャンネルと共にスレッドも全て消えているため、sync_map と
+        thread_meta のエントリは全て stale。これらを破棄して、アクティブな
+        タスクが新しい Forum に作り直されるようにする。env の
+        FORUM_SYNC_CHANNEL_ID は書き換えられないので更新を促すログを出す。
+        """
+        self._sync_map.clear()
+        self._thread_meta.clear()
+        logger.warning(
+            "Forum recovery complete → new channel %s. Cleared stale sync_map / "
+            "thread_meta (old threads were deleted with the old forum). "
+            "Set FORUM_SYNC_CHANNEL_ID=%s to pin the new forum.",
+            new_channel_id, new_channel_id,
+        )
 
     # ---- Tag management ----
 

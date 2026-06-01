@@ -86,6 +86,8 @@ Discord Developer Portal でボットに付与が必要な権限:
 4. If none found → attempt to create `#kanban` in the first guild. The new forum's **Post Guidelines** (the channel `topic`) is set to `get_forum_guidelines()` — a short i18n (`FORUM_GUIDELINES`, en/ja per `FORUM_SYNC_LANG`) explainer of the Kanban sync and how to use it (thread=task, status tags, comment/attachment sync, new-thread→new-task). Only written on creation; an already-existing forum's topic is left untouched.
 5. If creation fails (403) → print `ADMIN_GUIDE_MESSAGE` and abort.
 
+**Configured forum deleted (self-heal):** if the configured `FORUM_SYNC_CHANNEL_ID` returns 404 (`NotFoundError` — the forum was deleted on Discord), step 1 does **not** abort. It clears the dead `channel_id` and falls through to steps 3–4 (rediscover an existing forum, else recreate `#kanban`). On success `_reset_state_after_forum_recovery()` clears `sync_map` + `thread_meta` (every thread died with the old forum, so all entries are stale) and logs a warning to update `FORUM_SYNC_CHANNEL_ID` to the new channel. Active tasks get fresh threads in the new forum on subsequent sync cycles. Note: a non-404 `DiscordForumError` (transient/permission) still aborts with the guide — only a confirmed 404 triggers recreation, to avoid spawning duplicate forums on a hiccup.
+
 ### Persistence files
 
 Both JSON files live inside the plugin directory:
