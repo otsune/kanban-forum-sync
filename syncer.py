@@ -978,11 +978,58 @@ class KanbanForumSyncer:
         self._state.last_sync = str(int(time.time()))
         logger.info("Initial sync complete: %d synced, %d errors", synced, errors)
 
+    def _ensure_channel_alive(self) -> bool:
+        """稼働中に Forum チャンネルが削除されていないか確認し、削除されていたら
+        ランタイムで self-heal（再解決・再生成）する。
+
+        _resolve_forum_channel は起動時に1回だけ走るため、長時間動いている watcher は
+        稼働後に削除されたチャンネルを掴んだまま 404 を出し続ける。毎ポーリングで
+        軽量に生存確認し、404 なら再解決して新しい Forum に追従する。
+
+        Returns: True=チャンネル利用可能, False=復旧できず（このサイクルはスキップ）
+        """
+        if self._channel_id is not None:
+            try:
+                channel = self.discord.get_channel()
+                if channel.get("type") == FORUM_CHANNEL_TYPE:
+                    return True
+                # 型が変わった等 → 再解決に委ねる
+            except NotFoundError:
+                logger.warning(
+                    "Forum channel %s disappeared while running; re-resolving (self-heal).",
+                    self._channel_id,
+                )
+            except DiscordForumError as e:
+                # 一時的エラーは再解決せずこのサイクルだけ様子見
+                logger.debug("Channel health check transient error: %s", e)
+                return True
+
+        old_channel = self._channel_id
+        ok = self._resolve_forum_channel()
+        if ok and self._channel_id != old_channel:
+            # 新しい Forum に切り替わった → タグを作り直し、タグマップを再構築する
+            # （旧 Forum のタグIDは無効。これを怠るとタグ同期・新規スレッド作成が壊れる）
+            logger.info(
+                "Switched to forum %s at runtime; rebuilding tags.", self._channel_id
+            )
+            try:
+                self._ensure_tags()
+                self._build_tag_map()
+            except Exception as e:
+                logger.error("Failed to rebuild tags after channel switch: %s", e)
+                return False
+        return ok
+
     def incremental_sync(self):
         """増分同期（1回のポーリング）
 
         Phase 1: Kanban DB の変更を検出 → Forum に反映
         Phase 2: Forum の変更を検出 → Kanban にフィードバック"""
+        # 稼働中のチャンネル削除に追従（self-heal）。復旧できなければ今回はスキップ。
+        if not self._ensure_channel_alive():
+            logger.warning("Forum channel unavailable this cycle; skipping sync.")
+            return
+
         last_id = self._state.last_event_id
         changed = self.kanban.get_tasks_changed_since_event(last_id)
 
