@@ -276,6 +276,16 @@ class KanbanForumSyncer:
         self._channel_id = channel_id
         self.discord.channel_id = channel_id
 
+    def _drop_stale_thread(self, thread_id: int) -> None:
+        """削除された（404）スレッドを sync_map と thread_meta の両方から除去する。
+
+        sync_map だけ消すと thread_meta に孤児エントリが残り続けるため、
+        必ずペアで掃除する。"""
+        stale_task_id = self._sync_map.get_by_thread_id(thread_id)
+        if stale_task_id:
+            self._sync_map.remove(stale_task_id)
+        self._thread_meta.remove(thread_id)
+
     def _find_or_create_forum_in_guild(self, guild_id: int) -> bool:
         """指定サーバーで Forum チャンネルを検索し、なければ作成する。"""
         existing = self.discord.find_forum_channel(guild_id)
@@ -516,9 +526,7 @@ class KanbanForumSyncer:
             except Exception as e:
                 if "Resource not found" in str(e):
                     logger.warning("Thread %s no longer exists; removing from sync_map", thread_id)
-                    stale_task_id = self._sync_map.get_by_thread_id(thread_id)
-                    if stale_task_id:
-                        self._sync_map.remove(stale_task_id)
+                    self._drop_stale_thread(thread_id)
                 else:
                     logger.warning("Failed to fetch messages for thread %s: %s", thread_id, e)
                 continue
@@ -596,9 +604,7 @@ class KanbanForumSyncer:
             except Exception as e:
                 if "Resource not found" in str(e):
                     logger.warning("Thread %s no longer exists; removing from sync_map", thread_id)
-                    stale_task_id = self._sync_map.get_by_thread_id(thread_id)
-                    if stale_task_id:
-                        self._sync_map.remove(stale_task_id)
+                    self._drop_stale_thread(thread_id)
                 else:
                     logger.warning("Failed to fetch thread %s: %s", thread_id, e)
                 continue
@@ -819,9 +825,7 @@ class KanbanForumSyncer:
                 except Exception as e:
                     if "Resource not found" in str(e):
                         logger.warning("Thread %s not found while posting comment; removing stale mapping", thread_id)
-                        stale_task_id = self._sync_map.get_by_thread_id(thread_id)
-                        if stale_task_id:
-                            self._sync_map.remove(stale_task_id)
+                        self._drop_stale_thread(thread_id)
                     else:
                         logger.warning("Failed to post comment %s to thread %s: %s", c["id"], thread_id, e)
                     break
@@ -848,9 +852,7 @@ class KanbanForumSyncer:
                             "Thread %s not found while posting event %s; removing stale mapping",
                             thread_id, ev["id"],
                         )
-                        stale_task_id = self._sync_map.get_by_thread_id(thread_id)
-                        if stale_task_id:
-                            self._sync_map.remove(stale_task_id)
+                        self._drop_stale_thread(thread_id)
                     else:
                         logger.warning("Failed to post event %s to thread %s: %s", ev["id"], thread_id, e)
                     break
@@ -946,7 +948,7 @@ class KanbanForumSyncer:
                 )
                 return False
             # ここから先は update パスでの 404 = スレッドだけが削除されたケース。
-            self._sync_map.remove(task_id)
+            self._drop_stale_thread(thread_id)
             # アーカイブ済み/完了タスクは再作成しない（ユーザーが意図的に削除した
             # 終了済みスレッドを作り直さない）。アクティブなタスクのみ再作成する。
             if task["status"] in ARCHIVE_STATUSES:
