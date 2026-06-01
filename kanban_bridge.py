@@ -117,6 +117,53 @@ class KanbanBridge:
         finally:
             conn.close()
 
+    # ---- ワーカー実行ログ（per-task テキストログ） ----
+    #
+    # ~/.hermes/kanban/logs/<task_id>.log にワーカーエージェントの発話・思考が
+    # 記録される（task_events とは別ソース）。Hermes の発話は罫線ボックス
+    #   ╭─ ⚕ Hermes ─╮
+    #       本文…
+    #   ╰──────────╯
+    # に入る。このボックス本文だけを抽出して返す。
+
+    WORKER_LOG_DIR = os.path.expanduser("~/.hermes/kanban/logs")
+    _HERMES_BOX_TOP = "╭─"
+    _HERMES_BOX_MARK = "Hermes"
+    _HERMES_BOX_BOT = "╰─"
+
+    def get_worker_log_messages(self, task_id: str) -> list[str]:
+        """per-task ワーカーログから Hermes 発話ボックスの本文を順に返す。
+
+        ファイルが無ければ空リスト。各 run の追記が連結されているため、
+        返り値は時系列順。カーソル管理は呼び出し側（投稿済み件数）が行う。
+        """
+        path = os.path.join(self.WORKER_LOG_DIR, f"{task_id}.log")
+        if not os.path.exists(path):
+            return []
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                lines = fh.read().splitlines()
+        except Exception as e:
+            logger.warning("Failed to read worker log %s: %s", path, e)
+            return []
+
+        blocks: list[str] = []
+        i = 0
+        n = len(lines)
+        while i < n:
+            line = lines[i]
+            if self._HERMES_BOX_TOP in line and self._HERMES_BOX_MARK in line:
+                body: list[str] = []
+                i += 1
+                while i < n and self._HERMES_BOX_BOT not in lines[i]:
+                    body.append(lines[i].strip())
+                    i += 1
+                text = "\n".join(body).strip()
+                if text:
+                    blocks.append(text)
+            i += 1
+        return blocks
+
     # ---- 書き込み（Kanban toolset 経由） ----
 
     def _dispatch_kanban_tool(self, tool_name: str, args: dict) -> Optional[dict]:

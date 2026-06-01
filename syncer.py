@@ -857,6 +857,38 @@ class KanbanForumSyncer:
                         logger.warning("Failed to post event %s to thread %s: %s", ev["id"], thread_id, e)
                     break
 
+            # --- ワーカー実行ログ（per-task テキストログの Hermes 発話） ---
+            # task_events には現れないワーカーの発話・思考を同期する。
+            # 投稿済み件数をカーソルにして新規ブロックだけ送る（at-least-once）。
+            try:
+                blocks = self.kanban.get_worker_log_messages(task_id)
+            except Exception as e:
+                logger.warning("Failed to read worker log for task %s: %s", task_id, e)
+                blocks = []
+
+            sent_count = self._thread_meta.get_worker_log_count(thread_id)
+            if len(blocks) > sent_count:
+                for idx in range(sent_count, len(blocks)):
+                    body = blocks[idx]
+                    text = f"📝 **Worker log**\n{body}"
+                    try:
+                        self.discord.send_message(thread_id, text[:2000])
+                        posted += 1
+                        time.sleep(0.5)
+                        self._thread_meta.set_worker_log_count(thread_id, idx + 1)
+                    except Exception as e:
+                        if "Resource not found" in str(e):
+                            logger.warning(
+                                "Thread %s not found while posting worker log; removing stale mapping",
+                                thread_id,
+                            )
+                            self._drop_stale_thread(thread_id)
+                        else:
+                            logger.warning(
+                                "Failed to post worker log to thread %s: %s", thread_id, e
+                            )
+                        break
+
         if posted:
             logger.info("Synced %d comment/log(s) to forum threads", posted)
 

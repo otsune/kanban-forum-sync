@@ -231,6 +231,19 @@ class ThreadMetaTracker:
             self._data[key]["last_kanban_event_id"] = event_id
             self._save()
 
+    def get_worker_log_count(self, thread_id: int) -> int:
+        """既に Discord に投稿したワーカーログ発話ブロックの件数。"""
+        with self._lock:
+            return self._data.get(str(thread_id), {}).get("worker_log_count", 0)
+
+    def set_worker_log_count(self, thread_id: int, count: int):
+        with self._lock:
+            key = str(thread_id)
+            if key not in self._data:
+                self._data[key] = {}
+            self._data[key]["worker_log_count"] = count
+            self._save()
+
     def keys(self) -> list[int]:
         """全追跡スレッドID"""
         with self._lock:

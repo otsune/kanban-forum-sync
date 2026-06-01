@@ -86,6 +86,7 @@ Discord Developer Portal でボットに付与する権限。
 2. New tasks: `DiscordForumClient.create_thread()` → saves mapping in `SyncMap`.
 3. Updated tasks: `DiscordForumClient.update_thread()` with new name, tags, or `archived=True`.
 4. `last_event_id` advances to `MAX(task_events.id)` after each cycle.
+5. **Comments + worker events + worker logs → thread** (`_sync_kanban_comments_to_forum`): per mapped thread it posts (a) new `task_comments`, (b) new `task_events` of `_WORKER_LOG_KINDS` formatted by `_format_worker_event`, and (c) **worker speech from the per-task text log** `~/.hermes/kanban/logs/<task_id>.log`. The agent's spoken/thinking output (e.g. "判断が必要なため、タスクをブロックしました") lives **only** in that log file, not in `task_events` — `KanbanBridge.get_worker_log_messages()` extracts the `╭─ ⚕ Hermes ─╮ … ╰─╯` box bodies and they're posted as `📝 Worker log`. Cursor is a posted-block count (`ThreadMetaTracker.get/set_worker_log_count`), advanced one block at a time (at-least-once).
 
 **Discord → Kanban (Phase 2):**
 - **Comments**: New thread messages (non-bot) → `KanbanBridge.add_comment()` → `kanban_comment`. Uses `ThreadMetaTracker` to track the last durably processed message ID per thread.
