@@ -43,8 +43,11 @@ hermes plugins enable kanban-forum-sync
 2. 「Bot」タブで Token を生成 → `FORUM_SYNC_BOT_TOKEN`
 3. 「OAuth2 → URL Generator」で権限設定:
    - **SCOPES:** `bot`
-   - **BOT PERMISSIONS:** `Send Messages`, `Manage Threads`, `Read Message History`, `Create Public Threads`
+   - **BOT PERMISSIONS（必須）:** `View Channel`, `Send Messages`, `Create Public Threads`, `Send Messages in Threads`, `Manage Threads`, `Read Message History`
+   - **BOT PERMISSIONS（推奨）:** `Manage Channels` — Forum チャンネルの自動生成・自動復旧（self-heal）に必要。無い場合は手動で Forum を作成すること
 4. 生成された URL で Bot をサーバーに招待
+
+> 権限の詳細（必須/推奨の区分と用途）は `CLAUDE.md` の「Required / recommended Bot permissions」を参照。
 
 ### 2. Forum チャンネル（自動解決可能）
 

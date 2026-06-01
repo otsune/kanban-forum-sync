@@ -27,21 +27,36 @@ HERMES_PLUGINS_DEBUG=1 hermes plugins list
 
 No build step, test suite, or linter is currently configured for this plugin.
 
-## Required Bot permissions
+## Required / recommended Bot permissions
 
-Discord Developer Portal でボットに付与が必要な権限:
+Discord Developer Portal でボットに付与する権限。
+
+### 必須（これが無いと同期が動かない）
 
 | 権限 | 用途 |
 |---|---|
 | `VIEW_CHANNEL` | Forum チャンネルの参照 |
 | `SEND_MESSAGES` | Forum チャンネルへの投稿 |
-| `CREATE_PUBLIC_THREADS` | スレッド作成 |
-| `SEND_MESSAGES_IN_THREADS` | スレッド内メッセージ投稿 |
-| `MANAGE_THREADS` | **必須**: アーカイブ設定 (`archived=True`) |
-| `READ_MESSAGE_HISTORY` | Phase 2 コメント同期 |
+| `CREATE_PUBLIC_THREADS` | スレッド作成（Kanban → Forum, Phase 1） |
+| `SEND_MESSAGES_IN_THREADS` | スレッド内メッセージ投稿（コメント・ログ同期） |
+| `MANAGE_THREADS` | アーカイブ設定 (`archived=True`)。`done`/`archived` 同期に必須 |
+| `READ_MESSAGE_HISTORY` | Phase 2 コメント同期（スレッドの新着メッセージ取得） |
 
-`MANAGE_THREADS` なしだと `done`/`archived` ステータスへの同期（スレッドアーカイブ）が 403 で失敗する。  
-`applied_tags` の変更はスレッドオーナー（Bot 自身が作成したスレッド）かつ非 moderated タグなら `MANAGE_THREADS` 不要。
+### 推奨（self-heal / 自動セットアップに必要）
+
+| 権限 | 用途 |
+|---|---|
+| `MANAGE_CHANNELS` | **推奨**: Forum チャンネルの自動生成・自動復旧。`FORUM_SYNC_CHANNEL_ID` 未設定時の `#kanban` 自動作成、および設定済み Forum が Discord 側で削除された際の再生成（self-heal）に必要 |
+
+### 推奨設定まとめ
+
+上記すべてを付与するのが推奨構成。最小権限で運用する場合は必須6つだけでも動くが、その場合は **Forum チャンネルを手動で作成**し（名前を `kanban`/`task-board`/`task_board`/`tasks` のいずれかにすれば自動検出される。任意名なら `FORUM_SYNC_CHANNEL_ID` を設定）、Bot にそのチャンネルへの上記必須権限を与えること。
+
+### 補足
+
+- `MANAGE_THREADS` なしだと `done`/`archived` ステータスへの同期（スレッドアーカイブ）が 403 で失敗する。
+- `applied_tags` の変更はスレッドオーナー（Bot 自身が作成したスレッド）かつ非 moderated タグなら `MANAGE_THREADS` 不要。
+- `MANAGE_CHANNELS` なしで設定済み Forum が削除されると、self-heal は既存 Forum の再検出までは行えるが**再生成はできず** `ADMIN_GUIDE_MESSAGE` を表示して再試行を続ける（権限付与または手動作成後、再起動なしで自動復帰する）。
 
 ## Required environment variables
 
