@@ -205,6 +205,41 @@ def get_admin_guide_message() -> str:
     return ADMIN_GUIDE_MESSAGES.get(_LANG, ADMIN_GUIDE_MESSAGES["en"])
 
 
+# ---- i18n: forum post guidelines (Discord フォーラムの「投稿ガイドライン」= topic) ----
+# Discord の topic 上限は 4096 文字。短くまとめる。
+FORUM_GUIDELINES: dict[str, str] = {
+    "en": (
+        "🔄 This forum is auto-synced with the Kanban board by kanban-forum-sync.\n\n"
+        "• Each thread = one Kanban task. Bot-created threads are titled "
+        "`task-<id>: <title>` — don't rename them.\n"
+        "• Status tags (Todo / Running / Blocked / Done …) mirror the task status. "
+        "Change a thread's tag and the Kanban task updates to match.\n"
+        "• Reply in a thread → your message is synced back as a comment on the task.\n"
+        "• Start a NEW thread (any title not beginning with `task-`) → a new Kanban "
+        "task is created from its title, first post, and tag.\n"
+        "• Attach files in a thread → posted to the task as a link (full upload coming soon).\n"
+        "• Don't post in bot threads if you don't want it mirrored to Kanban."
+    ),
+    "ja": (
+        "🔄 このフォーラムは kanban-forum-sync により Kanban ボードと自動同期されています。\n\n"
+        "• 1スレッド = 1 Kanban タスク。Bot が作るスレッドは `task-<id>: <タイトル>` "
+        "という名前です（リネームしないでください）。\n"
+        "• ステータスタグ（Todo / Running / Blocked / Done …）はタスクの状態と連動します。"
+        "スレッドのタグを変えると Kanban タスクの状態も変わります。\n"
+        "• スレッドに返信 → その内容がタスクのコメントとして同期されます。\n"
+        "• 新しいスレッドを立てる（`task-` で始まらない任意のタイトル）→ タイトル・最初の"
+        "投稿・タグから新しい Kanban タスクが作られます。\n"
+        "• スレッドにファイル添付 → タスクにリンクとして投稿されます（本格的な取込は近日対応）。\n"
+        "• Kanban に反映したくない投稿は Bot スレッドに書かないでください。"
+    ),
+}
+
+
+def get_forum_guidelines() -> str:
+    """現在の FORUM_SYNC_LANG に応じたフォーラム投稿ガイドライン（topic）を返す。"""
+    return FORUM_GUIDELINES.get(_LANG, FORUM_GUIDELINES["en"])
+
+
 class KanbanForumSyncer:
     """Kanban ↔ Discord Forum 同期エンジン"""
 
@@ -249,7 +284,9 @@ class KanbanForumSyncer:
             logger.info("Switched to forum #%s (%s)", existing["name"], existing["id"])
             return True
         try:
-            created = self.discord.create_forum_channel(guild_id, name="kanban")
+            created = self.discord.create_forum_channel(
+                guild_id, name="kanban", topic=get_forum_guidelines()
+            )
             self._set_channel(int(created["id"]))
             logger.info("Created forum #kanban (%s)", created["id"])
             return True

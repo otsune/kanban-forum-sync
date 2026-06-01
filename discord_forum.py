@@ -149,12 +149,16 @@ class DiscordForumClient:
         return None
 
     def create_forum_channel(self, guild_id: int,
-                             name: str = "kanban") -> dict:
-        """新しい Forum チャンネルを作成（type=15）。"""
+                             name: str = "kanban",
+                             topic: Optional[str] = None) -> dict:
+        """新しい Forum チャンネルを作成（type=15）。
+
+        ``topic`` は Discord フォーラムの「投稿ガイドライン」。未指定なら簡易説明。
+        """
         body = {
             "name": name,
             "type": FORUM_CHANNEL_TYPE,
-            "topic": "Kanban task board (auto-created by kanban-forum-sync)",
+            "topic": topic or "Kanban task board (auto-created by kanban-forum-sync)",
             "default_auto_archive_duration": 10080,  # 7 days
             "default_forum_layout": 0,
             "default_sort_order": 0,  # latest activity

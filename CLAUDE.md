@@ -83,7 +83,7 @@ Discord Developer Portal でボットに付与が必要な権限:
 1. Validate the configured `FORUM_SYNC_CHANNEL_ID` as a Forum (type=15).
 2. If channel is wrong type → search the same guild for a named Forum.
 3. If no `FORUM_SYNC_CHANNEL_ID` → scan all bot guilds for `kanban`/`task-board`/`task_board`/`tasks`.
-4. If none found → attempt to create `#kanban` in the first guild.
+4. If none found → attempt to create `#kanban` in the first guild. The new forum's **Post Guidelines** (the channel `topic`) is set to `get_forum_guidelines()` — a short i18n (`FORUM_GUIDELINES`, en/ja per `FORUM_SYNC_LANG`) explainer of the Kanban sync and how to use it (thread=task, status tags, comment/attachment sync, new-thread→new-task). Only written on creation; an already-existing forum's topic is left untouched.
 5. If creation fails (403) → print `ADMIN_GUIDE_MESSAGE` and abort.
 
 ### Persistence files
