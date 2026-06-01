@@ -1,4 +1,12 @@
 __pycache__/
 *.pyc
+
+# Runtime state files (per-DB slug variants included) and their temp/lock files
 sync_map.json
+sync_map_*.json
 thread_meta.json
+thread_meta_*.json
+origin_map.json
+origin_map_*.json
+*.json.lock
+*.json.tmp.*
