@@ -17,7 +17,7 @@ from .discord_forum import (
     FORUM_CHANNEL_TYPE,
 )
 from .kanban_bridge import KanbanBridge
-from .models import SyncState, SyncMap, SyncOriginTracker, ThreadMetaTracker
+from .models import SyncState, SyncMap, SyncOriginTracker, ThreadMetaTracker, db_slug
 
 logger = logging.getLogger(__name__)
 
@@ -244,7 +244,8 @@ class KanbanForumSyncer:
     """Kanban ↔ Discord Forum 同期エンジン"""
 
     def __init__(self, bot_token: str, channel_id: Optional[int] = None,
-                 poll_interval: int = 15, use_inotify: bool = False, ctx=None):
+                 poll_interval: int = 15, use_inotify: bool = False, ctx=None,
+                 db_path: Optional[str] = None):
         self.bot_token = bot_token
         self._channel_id = channel_id
         self.poll_interval = poll_interval
@@ -254,13 +255,22 @@ class KanbanForumSyncer:
         self._state = SyncState()
 
         self.discord = DiscordForumClient(bot_token, self._channel_id)
-        self.kanban = KanbanBridge(ctx=ctx)
+        # db_path 未指定なら KanbanBridge 既定（~/.hermes/kanban.db）。
+        # 別 DB（別 profile / per-board）の場合は状態ファイルも slug で分離し、
+        # profile 間で sync_map / thread_meta / origin_map が衝突しないようにする。
+        if db_path:
+            self.kanban = KanbanBridge(db_path=db_path, ctx=ctx)
+        else:
+            self.kanban = KanbanBridge(ctx=ctx)
+        slug = db_slug(self.kanban.db_path)
+        if slug:
+            logger.info("Using state-file slug '%s' for DB %s", slug, self.kanban.db_path)
 
-        self._sync_map = SyncMap()
-        self._origin_tracker = SyncOriginTracker()
+        self._sync_map = SyncMap(slug=slug)
+        self._origin_tracker = SyncOriginTracker(slug=slug)
         self._tag_map: dict[str, int] = {}
         self._reverse_tag_map: dict[int, str] = {}
-        self._thread_meta = ThreadMetaTracker()
+        self._thread_meta = ThreadMetaTracker(slug=slug)
         self._bot_user_id: Optional[str] = None
 
     @property

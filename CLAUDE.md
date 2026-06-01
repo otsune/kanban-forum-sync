@@ -67,6 +67,7 @@ Discord Developer Portal でボットに付与する権限。
 | `FORUM_SYNC_POLL_INTERVAL` | No | Polling interval in seconds (default: 15) |
 | `FORUM_SYNC_LANG` | No | Forum タグの言語。`en`（デフォルト）または `ja` |
 | `FORUM_SYNC_EVENT_DRIVEN` | No | Set to `1` to enable inotify-based event-driven sync (Linux only, default: 0) |
+| `HERMES_KANBAN_DB` | No | Kanban SQLite DB path (shared with Hermes core). Lets a profile sync a non-default DB. Unset → `~/.hermes/kanban.db`. Non-default paths get isolated state files via `db_slug()`. |
 
 ## Architecture
 
@@ -108,9 +109,12 @@ Discord Developer Portal でボットに付与する権限。
 
 ### Persistence files
 
-Both JSON files live inside the plugin directory:
+JSON state files live inside the plugin directory:
 - `sync_map.json` — `{task_id: discord_thread_id}` mapping. Cleared by `full_sync()`.
-- `thread_meta.json` — `{thread_id: {last_message_id: int}}` per-thread cursor for Phase 2 comment sync.
+- `thread_meta.json` — `{thread_id: {last_message_id, last_comment_id, last_kanban_event_id, worker_log_count}}` per-thread cursors.
+- `origin_map.json` — `{task_id: "kanban"|"forum"}` task origin tracker.
+
+**Per-DB isolation (slug):** when the syncer runs against a non-default Kanban DB (a different profile's `HERMES_KANBAN_DB`, or a per-board DB), the state files are suffixed with a `db_slug()` derived from the DB path — e.g. `sync_map_toomo.json`, `thread_meta_toomo.json`. The default `~/.hermes/kanban.db` yields an empty slug, keeping the original filenames (back-compat). This lets multiple gateway profiles each sync a different DB ↔ a different forum without clobbering each other's state. `db_slug()` lives in `models.py`; for `…/kanban/boards/<board>/kanban.db` it uses the board name, otherwise `<parentdir>_<basename>`.
 
 ### Status ↔ tag mapping
 
@@ -129,7 +133,7 @@ The `tasks` table has many additional columns not queried by this plugin. From `
 **Official task statuses (7 total):** `triage`, `todo`, `ready`, `running`, `blocked`, `done`, `archived`.  
 Forum-only tags are normalized before any Kanban write: `Backlog` → `triage`, `Scheduled` → `ready`, and `Review` → `running`. The bridge refuses non-standard statuses.
 
-**Multi-board DB path:** Default is `~/.hermes/kanban.db`, but per-board DBs live at `~/.hermes/kanban/boards/<slug>/kanban.db`. `KanbanBridge` hardcodes the default path (`KANBAN_DB_PATH` constant in `kanban_bridge.py`) and accepts `db_path` as a constructor argument, but `__init__.py` never passes it — there is no env var override. Supporting non-default boards requires wiring an env var (e.g. `FORUM_SYNC_DB_PATH`) through `_get_syncer()` → `KanbanForumSyncer` → `KanbanBridge`.
+**Multi-board / multi-profile DB path:** Default is `~/.hermes/kanban.db`, but per-board DBs live at `~/.hermes/kanban/boards/<slug>/kanban.db`. `_get_syncer()` reads **`HERMES_KANBAN_DB`** (the same env Hermes core honours) and passes it through `KanbanForumSyncer(db_path=…)` → `KanbanBridge(db_path=…)`; unset falls back to the default. The DB path also drives `db_slug()` so each DB gets isolated state files (see Persistence files). This is how a separate profile (e.g. `toomo`) with its own `.env` + `HERMES_KANBAN_DB` + `FORUM_SYNC_CHANNEL_ID` syncs a different board to a different forum. Each profile runs in its own gateway process, so its own singleton `_syncer_instance` reads that process's env.
 
 **Event-driven mode (inotify):** `FORUM_SYNC_EVENT_DRIVEN=1` enables `_run_loop_inotify()` which uses Linux inotify to watch `kanban.db` and `kanban.db-wal`. The loop reacts immediately to DB writes instead of sleeping for `POLL_INTERVAL`. `poll_interval` becomes the fallback timeout (runs Phase 2 Discord polling regardless). Implemented in `kanban_watcher.py` via ctypes + select, no extra dependencies. Note: the Hermes source has no `WS /api/plugins/kanban/events` WebSocket endpoint; the "kanban tail" command uses the same DB polling as this plugin.
 
@@ -174,4 +178,4 @@ This is distinct from `ctx.register_cli_command()` which uses argparse subparser
 
 - **Task deletion**: Rows deleted from `tasks` are invisible to the event-based poller. Deleted tasks will leave orphaned Discord threads with no automatic cleanup.
 - **Forum thread manually un-archived**: If a user manually un-archives a `done`/`archived` thread in Discord, the next sync cycle will re-archive it (the Kanban status hasn't changed). There is no reconciliation for this.
-- **Multiple Hermes profiles running simultaneously**: No file-level locking on `sync_map.json` or `thread_meta.json`; concurrent writes from two instances could corrupt state.
+- **Multiple Hermes profiles running simultaneously**: profiles that point at **different** `HERMES_KANBAN_DB` paths now get isolated state files via `db_slug()`, so they no longer clobber each other. Two instances pointed at the **same** DB (same slug) still share state files with no file-level locking — concurrent writes could corrupt state. Run at most one syncer per DB.

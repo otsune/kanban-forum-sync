@@ -13,6 +13,40 @@ _PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 SYNC_MAP_PATH = os.path.join(_PLUGIN_DIR, "sync_map.json")
 THREAD_META_PATH = os.path.join(_PLUGIN_DIR, "thread_meta.json")
 
+# 既定 DB（~/.hermes/kanban.db）のパス。これと一致する場合は slug 空＝従来ファイル名。
+_DEFAULT_KANBAN_DB = os.path.expanduser("~/.hermes/kanban.db")
+
+
+def db_slug(db_path: Optional[str]) -> str:
+    """Kanban DB パスから状態ファイル用の slug を生成する。
+
+    既定 DB（~/.hermes/kanban.db）または未指定なら "" を返し、状態ファイルは
+    従来の sync_map.json 等になる（後方互換）。それ以外（per-board / 別 DB）は
+    パスから安定した slug を作り sync_map_<slug>.json のように分離する。
+
+    マルチボード DB は ~/.hermes/kanban/boards/<board>/kanban.db 形式なので、
+    親ディレクトリ名（board slug）を優先採用する。
+    """
+    if not db_path:
+        return ""
+    norm = os.path.realpath(os.path.expanduser(db_path))
+    if norm == os.path.realpath(_DEFAULT_KANBAN_DB):
+        return ""
+    parent = os.path.basename(os.path.dirname(norm))
+    base = os.path.splitext(os.path.basename(norm))[0]
+    # boards/<board>/kanban.db → board 名を使う。それ以外は <parent>_<base>。
+    raw = parent if base == "kanban" and parent not in ("", ".hermes") else f"{parent}_{base}"
+    slug = "".join(c if c.isalnum() or c in "-_" else "_" for c in raw).strip("_")
+    return slug or "alt"
+
+
+def _slugged(path: str, slug: str) -> str:
+    """"…/sync_map.json" + slug → "…/sync_map_<slug>.json"（slug 空なら原文）。"""
+    if not slug:
+        return path
+    root, ext = os.path.splitext(path)
+    return f"{root}_{slug}{ext}"
+
 
 def _load_json_dict(path: str) -> dict:
     if not os.path.exists(path):
@@ -52,8 +86,8 @@ def _atomic_save_json(path: str, data: dict, **dump_kwargs) -> None:
 class SyncMap:
     """kanban_task_id (str) → discord_thread_id (int) の永続マッピング"""
 
-    def __init__(self, path: str = SYNC_MAP_PATH):
-        self._path = path
+    def __init__(self, path: str = SYNC_MAP_PATH, slug: str = ""):
+        self._path = _slugged(path, slug)
         self._lock = threading.RLock()
         self._data: dict[str, int] = {}
         self._load()
@@ -115,8 +149,8 @@ class SyncOriginTracker:
 
     ORIGIN_PATH = os.path.join(_PLUGIN_DIR, "origin_map.json")
 
-    def __init__(self, path: str = ORIGIN_PATH):
-        self._path = path
+    def __init__(self, path: str = ORIGIN_PATH, slug: str = ""):
+        self._path = _slugged(path, slug)
         self._lock = threading.RLock()
         self._data: dict[str, str] = {}  # task_id → "kanban" | "forum"
         self._load()
@@ -167,8 +201,8 @@ class ThreadMetaTracker:
       {"<thread_id>": {"last_message_id": <int>}, ...}
     """
 
-    def __init__(self, path: str = THREAD_META_PATH):
-        self._path = path
+    def __init__(self, path: str = THREAD_META_PATH, slug: str = ""):
+        self._path = _slugged(path, slug)
         self._lock = threading.RLock()
         self._data: dict[str, dict] = {}
         self._load()
