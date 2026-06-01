@@ -255,13 +255,11 @@ class KanbanForumSyncer:
         self._state = SyncState()
 
         self.discord = DiscordForumClient(bot_token, self._channel_id)
-        # db_path 未指定なら KanbanBridge 既定（~/.hermes/kanban.db）。
+        # db_path 未指定なら KanbanBridge が resolve_kanban_db_path（コア委譲）で
+        # HERMES_KANBAN_DB / HERMES_KANBAN_BOARD / 既定ボードを解決する。
         # 別 DB（別 profile / per-board）の場合は状態ファイルも slug で分離し、
         # profile 間で sync_map / thread_meta / origin_map が衝突しないようにする。
-        if db_path:
-            self.kanban = KanbanBridge(db_path=db_path, ctx=ctx)
-        else:
-            self.kanban = KanbanBridge(ctx=ctx)
+        self.kanban = KanbanBridge(db_path=db_path, ctx=ctx)
         slug = db_slug(self.kanban.db_path)
         if slug:
             logger.info("Using state-file slug '%s' for DB %s", slug, self.kanban.db_path)

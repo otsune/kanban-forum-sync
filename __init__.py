@@ -27,16 +27,15 @@ def _get_syncer():
                     "FORUM_SYNC_BOT_TOKEN も DISCORD_BOT_TOKEN も設定されていません"
                 )
         use_inotify = os.environ.get("FORUM_SYNC_EVENT_DRIVEN", "").strip().lower() in ("1", "true", "yes")
-        # Hermes 本体と同じ HERMES_KANBAN_DB を尊重し、別 profile が別 DB の
-        # Kanban を扱えるようにする（未設定なら KanbanBridge 既定の ~/.hermes/kanban.db）。
-        db_path = os.environ.get("HERMES_KANBAN_DB", "").strip() or None
+        # DB パス解決は KanbanBridge（resolve_kanban_db_path → コア委譲）に一任する。
+        # HERMES_KANBAN_DB / HERMES_KANBAN_BOARD / 既定ボードを Hermes 本体と同じ
+        # 順序で解決し、別 profile が別 DB の Kanban を扱えるようにする。
         _syncer_instance = KanbanForumSyncer(
             bot_token=bot_token,
             channel_id=channel_id,
             poll_interval=int(os.environ.get("FORUM_SYNC_POLL_INTERVAL", "15")),
             use_inotify=use_inotify,
             ctx=_plugin_ctx,
-            db_path=db_path,
         )
     return _syncer_instance
 

@@ -9,17 +9,39 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+# フォールバック用の既定 DB パス（コアの解決 API が使えない場合のみ使用）。
 KANBAN_DB_PATH = os.path.expanduser("~/.hermes/kanban.db")
 
 TASK_COLS = "id, title, body, status, priority, assignee, created_at, completed_at"
 KANBAN_STATUSES = {"triage", "todo", "ready", "running", "blocked", "done", "archived"}
 
 
+def resolve_kanban_db_path() -> str:
+    """Kanban DB パスを解決する。
+
+    解決ロジックはコア（``hermes_cli.kanban_db.kanban_db_path``）に委譲する。
+    これにより ``HERMES_KANBAN_DB`` → ``HERMES_KANBAN_BOARD`` → 既定ボード の
+    優先順位が Hermes 本体と常に一致する（プラグイン側で二重に持たない）。
+
+    コアが import できない/API が変わった場合は、生 env と既定パスに退避する。
+    """
+    try:
+        from hermes_cli import kanban_db as _kdb
+        return str(_kdb.kanban_db_path())
+    except Exception as e:
+        logger.warning(
+            "Could not use hermes_cli.kanban_db.kanban_db_path (%s); "
+            "falling back to HERMES_KANBAN_DB env / default", e,
+        )
+        return os.environ.get("HERMES_KANBAN_DB", "").strip() or KANBAN_DB_PATH
+
+
 class KanbanBridge:
     """Kanban DB への読み書きブリッジ"""
 
-    def __init__(self, db_path: str = KANBAN_DB_PATH, ctx=None):
-        self.db_path = db_path
+    def __init__(self, db_path: Optional[str] = None, ctx=None):
+        # db_path 明示指定が最優先。未指定ならコア委譲で解決。
+        self.db_path = db_path or resolve_kanban_db_path()
         self.ctx = ctx
 
     def _connect(self) -> sqlite3.Connection:
