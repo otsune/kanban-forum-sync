@@ -6,6 +6,7 @@ import os
 import ssl
 import time
 import logging
+import random
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 from urllib.parse import urlencode
@@ -42,12 +43,23 @@ class NotFoundError(DiscordForumError):
     pass
 
 
+class RateLimitError(DiscordForumError):
+    """429 の再試行を使い切った場合のエラー。"""
+    pass
+
+
 class DiscordForumClient:
     """Discord Forum API クライアント"""
+    _MIN_REQUEST_INTERVAL = 0.25
+    _MAX_HARD_RETRIES = 3
+    _MAX_RATE_RETRIES = 8
+    _MAX_RATE_WAIT = 60.0
 
     def __init__(self, bot_token: str, channel_id: Optional[int] = None):
         self.token = bot_token
         self.channel_id = channel_id
+        self._last_request_ts = 0.0
+        self._next_allowed_ts = 0.0
         self._headers = {
             "Authorization": f"Bot {bot_token}",
             "Content-Type": "application/json",
@@ -56,14 +68,62 @@ class DiscordForumClient:
 
     # ---- Low-level request ----
 
+    def _parse_retry_after(self, headers, error_body: str) -> float:
+        body_wait = 0.0
+        header_wait = 0.0
+
+        try:
+            retry_info = json.loads(error_body) if error_body else {}
+        except json.JSONDecodeError:
+            retry_info = {}
+
+        try:
+            body_wait = float(retry_info.get("retry_after", 0) or 0)
+        except (TypeError, ValueError):
+            body_wait = 0.0
+
+        try:
+            header_wait = float(headers.get("Retry-After", 0) or 0)
+        except (TypeError, ValueError):
+            header_wait = 0.0
+
+        wait = max(header_wait, body_wait, self._MIN_REQUEST_INTERVAL)
+        wait *= random.uniform(0.9, 1.1)
+        return min(wait, self._MAX_RATE_WAIT)
+
+    def _note_ratelimit_headers(self, headers) -> None:
+        remaining = headers.get("X-RateLimit-Remaining")
+        reset_after = headers.get("X-RateLimit-Reset-After")
+        if remaining != "0" or not reset_after:
+            return
+        try:
+            wait = max(float(reset_after), 0.0)
+        except (TypeError, ValueError):
+            return
+        self._next_allowed_ts = max(self._next_allowed_ts, time.monotonic() + wait)
+
+    def _wait_for_request_slot(self) -> None:
+        now = time.monotonic()
+        wait = max(
+            self._next_allowed_ts - now,
+            self._last_request_ts + self._MIN_REQUEST_INTERVAL - now,
+        )
+        if wait > 0:
+            time.sleep(wait)
+        self._last_request_ts = time.monotonic()
+
     def _request(self, method: str, path: str, body: dict = None) -> dict:
         url = f"{BASE_URL}{path}"
         data = json.dumps(body).encode() if body else None
-        req = Request(url, data=data, headers=self._headers, method=method)
-        max_retries = 3
-        for attempt in range(max_retries):
+        hard_attempt = 0
+        rate_attempt = 0
+
+        while True:
+            self._wait_for_request_slot()
+            req = Request(url, data=data, headers=self._headers, method=method)
             try:
                 with urlopen(req, timeout=30, context=_SSL_CONTEXT) as resp:
+                    self._note_ratelimit_headers(resp.headers)
                     raw = resp.read().decode()
                     if not raw:
                         return {}
@@ -71,17 +131,26 @@ class DiscordForumClient:
             except HTTPError as e:
                 error_body = e.read().decode()
                 if e.code == 429:
-                    retry_info = {}
-                    try:
-                        retry_info = json.loads(error_body)
-                    except json.JSONDecodeError:
-                        pass
-                    retry_after = retry_info.get("retry_after", 1)
-                    logger.warning(
-                        "Rate limited (attempt %d/%d), retrying in %ss",
-                        attempt + 1, max_retries, retry_after,
+                    rate_attempt += 1
+                    retry_after = self._parse_retry_after(e.headers, error_body)
+                    is_global = (
+                        e.headers.get("X-RateLimit-Scope") == "global"
+                        or e.headers.get("X-RateLimit-Global") == "true"
                     )
-                    time.sleep(retry_after)
+                    logger.warning(
+                        "Rate limited%s (attempt %d/%d), retrying in %.2fs: %s",
+                        " [GLOBAL]" if is_global else "",
+                        rate_attempt, self._MAX_RATE_RETRIES, retry_after, path,
+                    )
+                    self._next_allowed_ts = max(
+                        self._next_allowed_ts, time.monotonic() + retry_after
+                    )
+                    if rate_attempt >= self._MAX_RATE_RETRIES:
+                        raise RateLimitError(
+                            "Rate limit retries exhausted: %s" % path,
+                            http_code=429,
+                            body=error_body,
+                        )
                     continue
                 if e.code == 403:
                     raise DiscordPermissionError(
@@ -92,11 +161,33 @@ class DiscordForumClient:
                     raise NotFoundError(
                         "Resource not found: %s" % path, http_code=404, body=error_body
                     )
+                if e.code >= 500:
+                    hard_attempt += 1
+                    if hard_attempt < self._MAX_HARD_RETRIES:
+                        wait = min(2 ** hard_attempt, 10)
+                        logger.warning(
+                            "Discord API %s on %s (attempt %d/%d), retrying in %ss",
+                            e.code, path, hard_attempt, self._MAX_HARD_RETRIES, wait,
+                        )
+                        time.sleep(wait)
+                        continue
                 logger.error("Discord API error %s: %s", e.code, error_body)
                 raise DiscordForumError(
                     "API error %s: %s" % (e.code, error_body), http_code=e.code, body=error_body
                 )
-        raise DiscordForumError("Request failed after %d retries: %s" % (max_retries, path))
+            except Exception as e:
+                hard_attempt += 1
+                if hard_attempt < self._MAX_HARD_RETRIES:
+                    wait = min(2 ** hard_attempt, 10)
+                    logger.warning(
+                        "Request failed for %s (attempt %d/%d), retrying in %ss: %s",
+                        path, hard_attempt, self._MAX_HARD_RETRIES, wait, e,
+                    )
+                    time.sleep(wait)
+                    continue
+                raise DiscordForumError(
+                    "Request failed after %d retries: %s" % (self._MAX_HARD_RETRIES, path)
+                ) from e
 
     # ---- Channel / Guild operations ----
 

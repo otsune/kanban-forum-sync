@@ -14,6 +14,7 @@ from .discord_forum import (
     DiscordForumError,
     DiscordPermissionError,
     NotFoundError,
+    RateLimitError,
     FORUM_CHANNEL_TYPE,
 )
 from .kanban_bridge import KanbanBridge
@@ -242,6 +243,8 @@ def get_forum_guidelines() -> str:
 
 class KanbanForumSyncer:
     """Kanban ↔ Discord Forum 同期エンジン"""
+    _MIN_CYCLE_INTERVAL = 5.0
+    _MAX_RATE_BACKOFF = 120
 
     def __init__(self, bot_token: str, channel_id: Optional[int] = None,
                  poll_interval: int = 15, use_inotify: bool = False, ctx=None,
@@ -270,6 +273,8 @@ class KanbanForumSyncer:
         self._reverse_tag_map: dict[int, str] = {}
         self._thread_meta = ThreadMetaTracker(slug=slug)
         self._bot_user_id: Optional[str] = None
+        self._rate_backoff = 0
+        self._last_cycle_completed_at = 0.0
 
     @property
     def channel_id(self) -> Optional[int]:
@@ -514,7 +519,7 @@ class KanbanForumSyncer:
             f"📎 Discord 添付ファイル{size_note}: {filename}\n{url}",
         )
 
-    def _sync_forum_comments(self):
+    def _sync_forum_comments(self, threads_by_id: Optional[dict[int, dict]] = None):
         """Forum スレッドの新規メッセージを検出し、Kanban コメントとして追加する。"""
         sync_items = self._sync_map.items()
         if not sync_items:
@@ -525,6 +530,15 @@ class KanbanForumSyncer:
 
         for task_id, thread_id in sync_items.items():
             last_id = self._thread_meta.get_last_message_id(thread_id)
+            thread_meta = threads_by_id.get(thread_id) if threads_by_id else None
+            newest_id = 0
+            if thread_meta is not None:
+                try:
+                    newest_id = int(thread_meta.get("last_message_id") or 0)
+                except (TypeError, ValueError):
+                    newest_id = 0
+            if thread_meta is not None and newest_id and newest_id <= last_id:
+                continue
             after_param = last_id if last_id > 0 else None
 
             try:
@@ -599,7 +613,7 @@ class KanbanForumSyncer:
             self._state.comment_count += new_comments
             logger.info("Synced %d new comment(s) from forum", new_comments)
 
-    def _sync_forum_tags(self):
+    def _sync_forum_tags(self, threads_by_id: Optional[dict[int, dict]] = None):
         """Forum スレッドのタグ変更を検出し、Kanban ステータスに反映する。"""
         sync_items = self._sync_map.items()
         if not sync_items:
@@ -607,17 +621,31 @@ class KanbanForumSyncer:
 
         changed = 0
         for task_id, thread_id in sync_items.items():
-            try:
-                thread = self.discord.get_channel_by_id(thread_id)
-            except Exception as e:
-                if "Resource not found" in str(e):
-                    logger.warning("Thread %s no longer exists; removing from sync_map", thread_id)
-                    self._drop_stale_thread(thread_id)
-                else:
-                    logger.warning("Failed to fetch thread %s: %s", thread_id, e)
+            thread = threads_by_id.get(thread_id) if threads_by_id is not None else None
+            if threads_by_id is None:
+                try:
+                    thread = self.discord.get_channel_by_id(thread_id)
+                except Exception as e:
+                    if "Resource not found" in str(e):
+                        logger.warning("Thread %s no longer exists; removing from sync_map", thread_id)
+                        self._drop_stale_thread(thread_id)
+                    else:
+                        logger.warning("Failed to fetch thread %s: %s", thread_id, e)
+                    continue
+            elif thread is None:
+                # 共有リストは archived 先頭 50 件までしか含まないため、生きている
+                # archived スレッド（51件目以降）がここに来うる。リスト不在を即 stale 扱い
+                # すると誤って sync_map から落としてしまう。本物の削除は同サイクル先行の
+                # _sync_forum_comments() が 404 検出して掃除するので、ここは skip に留める。
+                logger.debug("Thread %s not in shared thread list; skipping tag sync this cycle", thread_id)
                 continue
 
-            applied = thread.get("applied_tags", [])
+            try:
+                applied = thread.get("applied_tags", [])
+            except AttributeError:
+                logger.warning("Invalid thread payload for %s; skipping tag sync", thread_id)
+                continue
+
             if not isinstance(applied, list):
                 continue
 
@@ -704,7 +732,26 @@ class KanbanForumSyncer:
         )
         return True
 
-    def _sync_forum_new_threads(self):
+    def _fetch_forum_threads(self) -> dict[int, dict]:
+        """Forum 配下の active + archived thread を 1 サイクル 1 回だけ取得する。"""
+        threads_by_id: dict[int, dict] = {}
+        try:
+            guild_id = self.discord.get_current_guild_id()
+            if guild_id:
+                for thread in self.discord.get_active_threads(guild_id):
+                    if str(thread.get("parent_id")) == str(self.channel_id):
+                        threads_by_id[int(thread["id"])] = thread
+        except Exception as e:
+            logger.warning("Failed to fetch active threads: %s", e)
+
+        try:
+            for thread in self.discord.get_archived_public_threads():
+                threads_by_id.setdefault(int(thread["id"]), thread)
+        except Exception as e:
+            logger.debug("Failed to fetch archived threads: %s", e)
+        return threads_by_id
+
+    def _sync_forum_new_threads(self, threads_by_id: Optional[dict[int, dict]] = None):
         """Forum チャンネルに新しく作成されたスレッドを検出し、Kanban タスクを作成する。
 
         同期マップに存在しないスレッドを見つけ、タイトル・本文・タグから
@@ -713,22 +760,7 @@ class KanbanForumSyncer:
         if self.channel_id is None:
             return
 
-        try:
-            guild_id = self.discord.get_current_guild_id()
-            active = self.discord.get_active_threads(guild_id) if guild_id else []
-            # guild レベルで全スレッドを取得し、この forum チャンネルのものだけ絞り込む
-            threads = [t for t in active if str(t.get("parent_id")) == str(self.channel_id)]
-        except Exception as e:
-            logger.warning("Failed to fetch active threads: %s", e)
-            threads = []
-
-        try:
-            archived = self.discord.get_archived_public_threads()
-        except Exception as e:
-            logger.debug("Failed to fetch archived threads: %s", e)
-            archived = []
-
-        all_threads = list({int(t["id"]): t for t in threads + archived}.values())
+        all_threads = list((threads_by_id or self._fetch_forum_threads()).values())
         if not all_threads:
             return
 
@@ -1074,6 +1106,16 @@ class KanbanForumSyncer:
                 return False
         return ok
 
+    def _is_rate_limit_cycle_error(self, exc: Exception) -> bool:
+        return getattr(exc, "http_code", None) == 429 or "Rate limit retries exhausted" in str(exc)
+
+    def _advance_rate_backoff(self) -> None:
+        self._rate_backoff = min(
+            max(self._rate_backoff * 2, self.poll_interval),
+            self._MAX_RATE_BACKOFF,
+        )
+        logger.warning("Rate limited cycle; backing off extra %ds", self._rate_backoff)
+
     def incremental_sync(self):
         """増分同期（1回のポーリング）
 
@@ -1083,6 +1125,8 @@ class KanbanForumSyncer:
         if not self._ensure_channel_alive():
             logger.warning("Forum channel unavailable this cycle; skipping sync.")
             return
+
+        threads_by_id = self._fetch_forum_threads()
 
         last_id = self._state.last_event_id
         changed = self.kanban.get_tasks_changed_since_event(last_id)
@@ -1101,9 +1145,9 @@ class KanbanForumSyncer:
             self._state.last_event_id = latest_event
             logger.debug("Updated last_event_id to %d", latest_event)
 
-        self._sync_forum_comments()
-        self._sync_forum_tags()
-        self._sync_forum_new_threads()
+        self._sync_forum_comments(threads_by_id)
+        self._sync_forum_tags(threads_by_id)
+        self._sync_forum_new_threads(threads_by_id)
         self._sync_kanban_comments_to_forum()
 
     # ---- Thread lifecycle ----
@@ -1169,10 +1213,15 @@ class KanbanForumSyncer:
         while not self._stop_event.is_set():
             try:
                 self.incremental_sync()
+                self._rate_backoff = 0
+                self._last_cycle_completed_at = time.monotonic()
             except Exception as e:
-                logger.error("Incremental sync failed: %s", e, exc_info=True)
-                self._state.last_error = str(e)
-            self._stop_event.wait(self.poll_interval)
+                if self._is_rate_limit_cycle_error(e):
+                    self._advance_rate_backoff()
+                else:
+                    logger.error("Incremental sync failed: %s", e, exc_info=True)
+                    self._state.last_error = str(e)
+            self._stop_event.wait(self.poll_interval + self._rate_backoff)
 
     def _run_loop_inotify(self):
         """inotify によるイベント駆動ループ。
@@ -1193,11 +1242,23 @@ class KanbanForumSyncer:
                 watcher.wait(timeout=self.poll_interval)
                 if self._stop_event.is_set():
                     break
+
+                elapsed = time.monotonic() - self._last_cycle_completed_at
+                if 0 < elapsed < self._MIN_CYCLE_INTERVAL:
+                    self._stop_event.wait(self._MIN_CYCLE_INTERVAL - elapsed)
+                    if self._stop_event.is_set():
+                        break
                 try:
                     self.incremental_sync()
+                    self._rate_backoff = 0
+                    self._last_cycle_completed_at = time.monotonic()
                 except Exception as e:
-                    logger.error("Incremental sync failed: %s", e, exc_info=True)
-                    self._state.last_error = str(e)
+                    if self._is_rate_limit_cycle_error(e):
+                        self._advance_rate_backoff()
+                        self._stop_event.wait(self._rate_backoff)
+                    else:
+                        logger.error("Incremental sync failed: %s", e, exc_info=True)
+                        self._state.last_error = str(e)
 
     def full_sync(self):
         """手動フル同期（CLI/スラッシュコマンド用）

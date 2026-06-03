@@ -2,12 +2,18 @@ import os
 import sys
 import tempfile
 import unittest
+import io
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
+from urllib.error import HTTPError
+
+from kanban_forum_sync import discord_forum
 from kanban_forum_sync import syncer
 from kanban_forum_sync.kanban_bridge import KanbanBridge
 from kanban_forum_sync.models import SyncMap, SyncState, ThreadMetaTracker
+from kanban_forum_sync.discord_forum import DiscordForumClient, RateLimitError
 from kanban_forum_sync.syncer import KanbanForumSyncer, _build_tag_tables
 
 
@@ -19,9 +25,14 @@ class FakeSyncMap:
 class FakeDiscord:
     def __init__(self, messages):
         self.messages = messages
+        self.calls = []
 
     def get_thread_messages(self, thread_id, after=None, limit=50):
+        self.calls.append((thread_id, after, limit))
         return self.messages
+
+    def get_channel_by_id(self, thread_id):
+        raise AssertionError("per-thread channel GET should not be used")
 
 
 class FakeKanban:
@@ -33,6 +44,18 @@ class FakeKanban:
         if body == self.fail_on_body:
             return False
         self.comments.append((task_id, author, body))
+        return True
+
+
+class FakeTagKanban:
+    def __init__(self):
+        self.status_updates = []
+
+    def get_task(self, task_id):
+        return {"id": task_id, "status": "todo"}
+
+    def update_task_status(self, task_id, status):
+        self.status_updates.append((task_id, status))
         return True
 
 
@@ -126,6 +149,47 @@ class SyncSafetyTests(unittest.TestCase):
         self.assertEqual(kanban.comments, [("task-1", "user-101", "first")])
         self.assertEqual(obj._thread_meta.get_last_message_id(123), 101)
 
+    def test_comment_sync_skips_fetch_when_shared_thread_meta_shows_no_change(self):
+        kanban = FakeKanban()
+        obj = self.make_syncer([], kanban)
+        obj._thread_meta.set_last_message_id(123, 200)
+
+        obj._sync_forum_comments({123: {"id": "123", "last_message_id": "200"}})
+
+        self.assertEqual(obj.discord.calls, [])
+        self.assertEqual(kanban.comments, [])
+
+    def test_tag_sync_uses_shared_thread_payload_instead_of_per_thread_get(self):
+        obj = KanbanForumSyncer.__new__(KanbanForumSyncer)
+        obj._sync_map = FakeSyncMap()
+        obj._thread_meta = ThreadMetaTracker(path=os.path.join(self.tmpdir, "thread_meta.json"))
+        obj.discord = FakeDiscord([])
+        obj.kanban = FakeTagKanban()
+        obj._state = SyncState()
+        obj._reverse_tag_map = {7: "Running"}
+
+        obj._sync_forum_tags({123: {"id": "123", "applied_tags": [7]}})
+
+        self.assertEqual(obj.kanban.status_updates, [("task-1", "running")])
+
+    def test_tag_sync_skips_thread_absent_from_shared_list_without_dropping(self):
+        # archived 先頭50件に載らない生存スレッドを誤って drop しないこと。
+        dropped = []
+        obj = KanbanForumSyncer.__new__(KanbanForumSyncer)
+        obj._sync_map = FakeSyncMap()
+        obj._thread_meta = ThreadMetaTracker(path=os.path.join(self.tmpdir, "thread_meta.json"))
+        obj.discord = FakeDiscord([])
+        obj.kanban = FakeTagKanban()
+        obj._state = SyncState()
+        obj._reverse_tag_map = {7: "Running"}
+        obj._drop_stale_thread = lambda tid: dropped.append(tid)
+
+        # 共有リストに thread 123 が無い（>50 archived シナリオ）
+        obj._sync_forum_tags({999: {"id": "999", "applied_tags": [7]}})
+
+        self.assertEqual(dropped, [])
+        self.assertEqual(obj.kanban.status_updates, [])
+
     def test_corrupt_json_is_backed_up_and_loads_empty(self):
         path = os.path.join(self.tmpdir, "sync_map.json")
         with open(path, "w") as f:
@@ -164,6 +228,27 @@ class SyncSafetyTests(unittest.TestCase):
             [name for name, _args in ctx.calls],
             ["kanban_block", "kanban_complete", "kanban_unblock"],
         )
+
+    def test_request_raises_rate_limit_error_after_dedicated_429_budget(self):
+        client = DiscordForumClient("token", channel_id=1)
+        client._MIN_REQUEST_INTERVAL = 0.0
+        err = HTTPError(
+            url="https://discord.com/api/v10/test",
+            code=429,
+            msg="Too Many Requests",
+            hdrs={"Retry-After": "0.5"},
+            fp=io.BytesIO(b'{"retry_after": 0.1}'),
+        )
+
+        with mock.patch.object(discord_forum, "urlopen", side_effect=err), \
+             mock.patch.object(discord_forum.time, "sleep"), \
+             mock.patch.object(discord_forum.time, "monotonic", return_value=0.0), \
+             mock.patch.object(discord_forum.random, "uniform", return_value=1.0):
+            with self.assertRaises(RateLimitError) as ctx:
+                client._request("GET", "/test")
+
+        self.assertEqual(ctx.exception.http_code, 429)
+        self.assertIn("Rate limit retries exhausted", str(ctx.exception))
 
 
 if __name__ == "__main__":
