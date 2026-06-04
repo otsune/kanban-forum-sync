@@ -5,9 +5,12 @@ import sqlite3
 import os
 import json
 import logging
-from typing import Optional
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
+
+# 「未計算」を表すセンチネル（None は「設定なし」を意味するため区別する）。
+_UNSET = object()
 
 # フォールバック用の既定 DB パス（コアの解決 API が使えない場合のみ使用）。
 KANBAN_DB_PATH = os.path.expanduser("~/.hermes/kanban.db")
@@ -43,6 +46,12 @@ class KanbanBridge:
         # db_path 明示指定が最優先。未指定ならコア委譲で解決。
         self.db_path = db_path or resolve_kanban_db_path()
         self.ctx = ctx
+        # kanban.default_assignee の解決結果をインスタンス寿命でキャッシュ。
+        # load_config() は呼び出し毎に config 全体を deepcopy して返すため、
+        # bulk 同期で create_task を多数回呼ぶ際の無駄を避ける。
+        # （config 変更の反映は bridge 再生成＝gateway 再起動時。default_assignee は
+        #   稀にしか変わらないため許容。）
+        self._default_assignee_cache: Any = _UNSET
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=120)
@@ -216,15 +225,21 @@ class KanbanBridge:
         YAML 正準・キー位置正確になる。手書きの行パースはしない。
         注: プロファイル解決には spawner が ``HERMES_HOME`` を渡す必要がある
         （未設定時は default プロファイルにフォールバック。issue #18594）。
+        結果はインスタンス寿命でキャッシュする（``__init__`` 参照）。
         """
+        if self._default_assignee_cache is not _UNSET:
+            return self._default_assignee_cache
+        result: Optional[str] = None
         try:
             from hermes_cli.config import load_config
             kanban_cfg = load_config().get("kanban") or {}
             value = (kanban_cfg.get("default_assignee") or "").strip()
-            return value or None
+            result = value or None
         except Exception as e:
             logger.debug("Failed to read kanban.default_assignee: %s", e)
-            return None
+            result = None
+        self._default_assignee_cache = result
+        return result
 
     def create_task(self, title: str, body: str = "",
                     status: str = "triage",
