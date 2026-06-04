@@ -208,6 +208,24 @@ class KanbanBridge:
             return None
         return result
 
+    def _config_default_assignee(self) -> Optional[str]:
+        """アクティブプロファイルの ``kanban.default_assignee`` を返す。
+
+        Hermes コアの設定ローダ経由で取得する（コア dispatcher と同じ読み方:
+        ``kanban.py`` / ``kanban_decompose.py``）。これによりプロファイル対応・
+        YAML 正準・キー位置正確になる。手書きの行パースはしない。
+        注: プロファイル解決には spawner が ``HERMES_HOME`` を渡す必要がある
+        （未設定時は default プロファイルにフォールバック。issue #18594）。
+        """
+        try:
+            from hermes_cli.config import load_config
+            kanban_cfg = load_config().get("kanban") or {}
+            value = (kanban_cfg.get("default_assignee") or "").strip()
+            return value or None
+        except Exception as e:
+            logger.debug("Failed to read kanban.default_assignee: %s", e)
+            return None
+
     def create_task(self, title: str, body: str = "",
                     status: str = "triage",
                     assignee: Optional[str] = None) -> Optional[str]:
@@ -226,12 +244,14 @@ class KanbanBridge:
         resolved_assignee = (
             assignee
             or os.environ.get("FORUM_SYNC_DEFAULT_ASSIGNEE")
+            or self._config_default_assignee()
             or os.environ.get("HERMES_PROFILE")
         )
         if not resolved_assignee:
             logger.error(
                 "create_task requires assignee for kanban_create; set "
-                "FORUM_SYNC_DEFAULT_ASSIGNEE"
+                "config.yaml の kanban.default_assignee か "
+                "FORUM_SYNC_DEFAULT_ASSIGNEE 環境変数"
             )
             return None
 
