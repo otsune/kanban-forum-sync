@@ -509,7 +509,7 @@ class KanbanForumSyncer:
         添付 toolset/CLI を Hermes 本体に追加する PR を申請済み:
         https://github.com/NousResearch/hermes-agent/pull/36019
         これがマージされ installed hermes-agent に入り次第、kanban_attach_url
-        経由の本物の取り込みに差し替える。切替手順は ATTACHMENT_TOOLSET_PR_PLAN.md
+        経由の本物の取り込みに差し替える。切替手順は docs/plans/ATTACHMENT_TOOLSET_PR_PLAN.md
         の "Upstream PR status" 節を参照。
 
         成功で True、一時的失敗で False（カーソルを進めず次サイクルで再試行）。

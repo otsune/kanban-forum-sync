@@ -252,8 +252,9 @@ requires_env:
 ## スコープ外（今回やらない）
 
 - **pip パッケージ化**（`pyproject.toml` + `[project.entry-points."hermes_agent.plugins"]`）— ユーザー選択により除外。将来配布時に別途。
-- 計画系 md（AUDIT.md 等）の `docs/` 集約 — レイアウト選択は「ガイド標準（コードはフラット）」のため見送り。
 - 添付ツールの本実装（別途 `ATTACHMENT_TOOLSET_PR_PLAN.md` / hermes-agent#36019 待ち）。
+
+> 注: 計画/監査系 md（AUDIT.md / *_PLAN.md）は後に `docs/plans/` へ集約した（コードはガイド標準どおりルート直下フラットのまま）。
 
 ---
 

@@ -198,6 +198,8 @@ Forum 側の補助タグは Kanban の正式ステータスへ正規化されま
 ├── kanban_bridge.py     # Kanban 読み取り + kanban_* tool 書き込みブリッジ
 ├── models.py            # SyncMap (JSON永続化), SyncState, ThreadMetaTracker
 ├── kanban_watcher.py    # inotify ベースの DB 変更検知（Linux）
+├── tests/               # unittest（test_sync_safety.py）
+├── docs/plans/          # 開発計画書・監査記録（AUDIT / *_PLAN）
 ├── LICENSE              # MIT License
 └── README.md
 ```
