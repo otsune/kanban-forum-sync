@@ -6,7 +6,7 @@ import os
 import re
 import time
 import logging
-from threading import Thread, Event
+from threading import Thread, Event, RLock
 from typing import Optional
 
 from .discord_forum import (
@@ -255,9 +255,14 @@ class KanbanForumSyncer:
         self._use_inotify = use_inotify
         self._thread: Optional[Thread] = None
         self._stop_event = Event()
+        # 1 サイクルずつ直列化するロック（再入可: full_sync → initial_sync のネスト用）。
+        # watcher スレッドの定期同期と、ツール/スラッシュ起動の resync が同一プロセス内で
+        # 並行して cursor を二重前進させ重複投稿するのを防ぐ。
+        self._sync_lock = RLock()
         self._state = SyncState()
 
         self.discord = DiscordForumClient(bot_token, self._channel_id)
+        self._ctx = ctx
         # db_path 未指定なら KanbanBridge が resolve_kanban_db_path（コア委譲）で
         # HERMES_KANBAN_DB / HERMES_KANBAN_BOARD / 既定ボードを解決する。
         # 別 DB（別 profile / per-board）の場合は状態ファイルも slug で分離し、
@@ -279,6 +284,10 @@ class KanbanForumSyncer:
     @property
     def channel_id(self) -> Optional[int]:
         return self._channel_id
+
+    def set_ctx(self, ctx) -> None:
+        self._ctx = ctx
+        self.kanban.ctx = ctx
 
     def get_state(self) -> SyncState:
         return self._state
@@ -679,6 +688,20 @@ class KanbanForumSyncer:
                             "Tag sync: task-%s %s → %s",
                             task_id, current["status"], new_status,
                         )
+                        if getattr(self, "_ctx", None) is not None:
+                            try:
+                                task_label = (
+                                    task_id
+                                    if str(task_id).startswith("task-")
+                                    else f"task-{task_id}"
+                                )
+                                self._ctx.inject_message(
+                                    "[forum-sync] Discord tag change updated "
+                                    f"{task_label}: {current['status']} -> {new_status}.",
+                                    role="user",
+                                )
+                            except Exception as e:
+                                logger.debug("inject_message failed: %s", e)
 
             time.sleep(0.5)
 
@@ -1043,26 +1066,27 @@ class KanbanForumSyncer:
 
     def initial_sync(self):
         """初回フル同期"""
-        logger.info("Starting initial sync...")
-        self._ensure_tags()
-        self._build_tag_map()
+        with self._sync_lock:
+            logger.info("Starting initial sync...")
+            self._ensure_tags()
+            self._build_tag_map()
 
-        tasks = self.kanban.get_all_tasks()
-        synced = 0
-        errors = 0
+            tasks = self.kanban.get_all_tasks()
+            synced = 0
+            errors = 0
 
-        for task in tasks:
-            if self._sync_task_to_forum(task):
-                synced += 1
-            else:
-                errors += 1
-            time.sleep(0.5)
+            for task in tasks:
+                if self._sync_task_to_forum(task):
+                    synced += 1
+                else:
+                    errors += 1
+                time.sleep(0.5)
 
-        self._state.task_count = synced
-        self._state.error_count = errors
-        self._state.last_event_id = self.kanban.get_latest_event_id()
-        self._state.last_sync = str(int(time.time()))
-        logger.info("Initial sync complete: %d synced, %d errors", synced, errors)
+            self._state.task_count = synced
+            self._state.error_count = errors
+            self._state.last_event_id = self.kanban.get_latest_event_id()
+            self._state.last_sync = str(int(time.time()))
+            logger.info("Initial sync complete: %d synced, %d errors", synced, errors)
 
     def _ensure_channel_alive(self) -> bool:
         """稼働中に Forum チャンネルが削除されていないか確認し、削除されていたら
@@ -1120,7 +1144,13 @@ class KanbanForumSyncer:
         """増分同期（1回のポーリング）
 
         Phase 1: Kanban DB の変更を検出 → Forum に反映
-        Phase 2: Forum の変更を検出 → Kanban にフィードバック"""
+        Phase 2: Forum の変更を検出 → Kanban にフィードバック
+
+        watcher スレッドとツール起動 resync の並行実行を防ぐためロックで直列化する。"""
+        with self._sync_lock:
+            self._incremental_sync_locked()
+
+    def _incremental_sync_locked(self):
         # 稼働中のチャンネル削除に追従（self-heal）。復旧できなければ今回はスキップ。
         if not self._ensure_channel_alive():
             logger.warning("Forum channel unavailable this cycle; skipping sync.")
@@ -1268,8 +1298,9 @@ class KanbanForumSyncer:
         404 になったスレッドは _sync_task_to_forum() 内の NotFoundError ハンドラが
         sync_map から除去して自動再作成する。
         """
-        if not self._resolve_forum_channel():
-            return
-        self._ensure_tags()
-        self._build_tag_map()
-        self.initial_sync()
+        with self._sync_lock:
+            if not self._resolve_forum_channel():
+                return
+            self._ensure_tags()
+            self._build_tag_map()
+            self.initial_sync()

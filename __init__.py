@@ -5,39 +5,10 @@ register(ctx) で Hermes プラグインシステムに登録。
 起動時に Watcher を開始し、Kanban DB の変更を Discord Forum に同期する。
 """
 
-import os
 import logging
-from .syncer import KanbanForumSyncer
+from . import schemas, service, tools
 
 logger = logging.getLogger(__name__)
-_syncer_instance = None
-_plugin_ctx = None
-
-
-def _get_syncer():
-    global _syncer_instance
-    if _syncer_instance is None:
-        channel_id_str = os.environ.get("FORUM_SYNC_CHANNEL_ID", "").strip()
-        channel_id = int(channel_id_str) if channel_id_str else None
-        bot_token = os.environ.get("FORUM_SYNC_BOT_TOKEN")
-        if not bot_token:
-            bot_token = os.environ.get("DISCORD_BOT_TOKEN")
-            if not bot_token:
-                raise RuntimeError(
-                    "FORUM_SYNC_BOT_TOKEN も DISCORD_BOT_TOKEN も設定されていません"
-                )
-        use_inotify = os.environ.get("FORUM_SYNC_EVENT_DRIVEN", "").strip().lower() in ("1", "true", "yes")
-        # DB パス解決は KanbanBridge（resolve_kanban_db_path → コア委譲）に一任する。
-        # HERMES_KANBAN_DB / HERMES_KANBAN_BOARD / 既定ボードを Hermes 本体と同じ
-        # 順序で解決し、別 profile が別 DB の Kanban を扱えるようにする。
-        _syncer_instance = KanbanForumSyncer(
-            bot_token=bot_token,
-            channel_id=channel_id,
-            poll_interval=int(os.environ.get("FORUM_SYNC_POLL_INTERVAL", "15")),
-            use_inotify=use_inotify,
-            ctx=_plugin_ctx,
-        )
-    return _syncer_instance
 
 
 # ---- CLI サブコマンド ----
@@ -105,28 +76,80 @@ def cli_sync(args):
 
 
 def _get_syncer_or_print_error():
-    try:
-        return _get_syncer()
-    except RuntimeError as e:
-        print(f"kanban-forum-sync: {e}")
+    syncer = service.get_syncer_or_none()
+    if syncer is None:
+        print("kanban-forum-sync: syncer unavailable (bot token 未設定?)")
         return None
+    return syncer
+
+
+# ---- Slash command ----
+
+
+def _format_status(syncer):
+    state = syncer.get_state()
+    text = (
+        f"state={state.state} channel={syncer.channel_id or '(auto)'} "
+        f"tasks={state.task_count} comments={state.comment_count} "
+        f"tags={state.tag_sync_count} forum_tasks={state.forum_task_count}"
+    )
+    if state.last_error:
+        text += f"\nlast_error={state.last_error}"
+    return text
+
+
+def _slash_handler(raw_args: str) -> str:
+    parts = (raw_args or "").strip().split()
+    action = (parts[0].lower() if parts else "status")
+    syncer = service.get_syncer_or_none()
+    if syncer is None:
+        return "kanban-forum-sync: syncer unavailable (bot token 未設定?)"
+    try:
+        if action == "status":
+            return _format_status(syncer)
+        if action == "sync":
+            syncer.full_sync()
+            return "Full sync complete."
+        if action == "start":
+            syncer.start()
+            return "Watcher started."
+        if action == "stop":
+            syncer.stop()
+            return "Watcher stopped."
+        return f"unknown action '{action}'. use: status|sync|start|stop"
+    except Exception as e:
+        return f"kanban-forum-sync: {action} failed: {e}"
 
 
 # ---- 登録 ----
 
 
 def register(ctx):
-    global _plugin_ctx
-    _plugin_ctx = ctx
-    if _syncer_instance is not None:
-        _syncer_instance.kanban.ctx = ctx
+    service.set_ctx(ctx)
     ctx.register_cli_command(
         "kanban-forum-sync",
         "Kanban ↔ Discord Forum sync management",
         setup_fn=cli_setup,
     )
+    ctx.register_tool(
+        name="kanban_forum_sync_status",
+        toolset="kanban_forum_sync",
+        schema=schemas.KANBAN_FORUM_SYNC_STATUS,
+        handler=tools.kanban_forum_sync_status,
+    )
+    ctx.register_tool(
+        name="kanban_forum_sync_resync",
+        toolset="kanban_forum_sync",
+        schema=schemas.KANBAN_FORUM_SYNC_RESYNC,
+        handler=tools.kanban_forum_sync_resync,
+    )
+    ctx.register_command(
+        name="kanban-forum-sync",
+        handler=_slash_handler,
+        description="Kanban ↔ Discord Forum sync: status|sync|start|stop",
+    )
     try:
-        syncer = _get_syncer()
+        syncer = service.get_syncer()
         syncer.start()
         logger.info("Kanban ↔ Discord Forum sync watcher started.")
     except Exception as e:

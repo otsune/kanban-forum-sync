@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A [Hermes Agent](https://hermes-agent.nousresearch.com/) plugin that bidirectionally syncs Kanban tasks to Discord Forum channels. Kanban task changes are pushed to Discord as forum threads (Phase 1), and Discord tag changes / new messages are reflected back into Kanban (Phase 2).
+A [Hermes Agent](https://hermes-agent.nousresearch.com/) plugin that bidirectionally syncs Kanban tasks to Discord Forum channels. Kanban task changes are pushed to Discord as forum threads (Phase 1), and Discord tag changes / new messages are reflected back into Kanban (Phase 2). The plugin also exposes Hermes agent tools and a session slash command for runtime management.
 
 ## CLI commands
 
@@ -25,7 +25,29 @@ HERMES_PLUGINS_DEBUG=1 hermes plugins list
 /plugins
 ```
 
-No build step, test suite, or linter is currently configured for this plugin.
+## Agent tools and slash command
+
+Hermes registers these tools in the `kanban_forum_sync` toolset:
+
+| Tool | Args | Description |
+|---|---|---|
+| `kanban_forum_sync_status` | none | JSON status: watcher state, channel id, last sync, counters, last error |
+| `kanban_forum_sync_resync` | `mode`: `incremental` or `full` | Runs one immediate sync cycle. `full` does not clear `sync_map.json` |
+
+Session command:
+
+```text
+/kanban-forum-sync status
+/kanban-forum-sync sync
+/kanban-forum-sync start
+/kanban-forum-sync stop
+```
+
+Tests are stdlib `unittest`:
+
+```bash
+python3 -m unittest tests.test_sync_safety
+```
 
 ## Required / recommended Bot permissions
 
@@ -67,13 +89,17 @@ Discord Developer Portal でボットに付与する権限。
 | `FORUM_SYNC_POLL_INTERVAL` | No | Polling interval in seconds (default: 15) |
 | `FORUM_SYNC_LANG` | No | Forum タグの言語。`en`（デフォルト）または `ja` |
 | `FORUM_SYNC_EVENT_DRIVEN` | No | Set to `1` to enable inotify-based event-driven sync (Linux only, default: 0) |
+| `FORUM_SYNC_DEFAULT_ASSIGNEE` | No | Assignee used when human-created Forum threads become Kanban tasks |
 | `HERMES_KANBAN_DB` | No | Kanban SQLite DB path. Resolution is delegated to core (`hermes_cli.kanban_db.kanban_db_path`), so `HERMES_KANBAN_BOARD` and the active board are also honoured. Lets a profile sync a non-default DB. Unset → `~/.hermes/kanban.db`. Non-default paths get isolated state files via `db_slug()`. |
 
 ## Architecture
 
 ### Module responsibilities
 
-- **`__init__.py`** — Hermes plugin entry point. `register(ctx)` wires the `kanban-forum-sync` CLI subcommand and auto-starts the watcher. Holds the singleton `KanbanForumSyncer`.
+- **`__init__.py`** — Hermes plugin entry point. `register(ctx)` wires the `kanban-forum-sync` CLI subcommand, `/kanban-forum-sync` session command, agent tools, and auto-starts the watcher.
+- **`service.py`** — Shared runtime accessors for plugin context and the singleton `KanbanForumSyncer`, used by both `__init__.py` and `tools.py`.
+- **`schemas.py`** — JSON schemas/descriptions for the Hermes agent tools.
+- **`tools.py`** — Tool handlers. They follow the Hermes handler contract: accept `args: dict` plus `**kwargs`, return JSON strings, and convert failures into JSON errors.
 - **`syncer.py`** — Core sync engine (`KanbanForumSyncer`). Runs a daemon thread in either polling (`_run_loop_poll`) or inotify event-driven (`_run_loop_inotify`) mode. Handles Forum channel auto-resolution, tag management, and both sync directions.
 - **`kanban_watcher.py`** — inotify-based file watcher (`KanbanDBWatcher`). Watches `kanban.db` and `kanban.db-wal` via Linux inotify (ctypes, no extra deps). Context manager; falls back to timeout-only when inotify is unavailable.
 - **`discord_forum.py`** — Thin Discord REST v10 client (`DiscordForumClient`). Uses only stdlib (`urllib`). Rate limiting is handled in-client: 429 retries use a separate budget from hard failures, `Retry-After`/`X-RateLimit-*` headers are honored, requests are smoothed by a minimum inter-request gap, and exhausted 429s raise `RateLimitError`. Other typed exceptions remain `DiscordPermissionError` (403), `NotFoundError` (404), `DiscordForumError` (other).
@@ -92,7 +118,7 @@ Discord Developer Portal でボットに付与する権限。
 **Discord → Kanban (Phase 2):**
 - **Comments**: New thread messages (non-bot) → `KanbanBridge.add_comment()` → `kanban_comment`. Uses `ThreadMetaTracker` to track the last durably processed message ID per thread.
 - **Attachments** (interim): Files on a thread message (non-bot) → `_sync_attachment()` posts the Discord file URL as a `kanban_comment`. There is currently **no attachment toolset tool or CLI** in Hermes (registered kanban tools are only show/list/complete/block/heartbeat/comment/create/unblock/link; the only writer is `kanban_db.add_attachment`, a direct-DB call that violates this plugin's DB-access policy). So files are surfaced as comment links rather than true `task_attachments` uploads. Once an attachment toolset/CLI lands in hermes-agent (see `ATTACHMENT_TOOLSET_PR_PLAN.md`), swap `_sync_attachment()` to do a real upload. Attachments share the per-message `last_message_id` cursor with comments — a message advances the cursor only after all its attachments **and** its text body sync successfully (at-least-once; a partial failure re-runs the whole message next cycle).
-- **Tag changes**: `applied_tags` on each thread → reverse-lookup in `_tag_map` → `KanbanBridge.update_task_status()`. Only semantic tool transitions are applied (`kanban_block`, `kanban_complete`, `kanban_unblock`); unsupported arbitrary status edits are skipped rather than written directly to SQLite.
+- **Tag changes**: `applied_tags` on each thread → reverse-lookup in `_tag_map` → `KanbanBridge.update_task_status()`. Only semantic tool transitions are applied (`kanban_block`, `kanban_complete`, `kanban_unblock`); unsupported arbitrary status edits are skipped rather than written directly to SQLite. After a successful status update, `_sync_forum_tags()` calls `ctx.inject_message(..., role="user")` to notify the active agent conversation; injection failures are debug-logged and do not fail the sync.
 
 ### Forum channel auto-resolution order
 
@@ -147,6 +173,7 @@ Forum-only tags are normalized before any Kanban write: `Backlog` → `triage`, 
 - **JSON sync map over DB**: `sync_map.json` was chosen over storing task↔thread mappings in the Kanban SQLite DB to keep the plugin stateless with respect to the Kanban schema and easy to reset by deleting the file.
 - **Event-ID-based change detection**: `task_events.id` (monotonically increasing) is used instead of `tasks.updated_at` timestamps to avoid timezone/clock-skew issues.
 - **Per-task exception isolation**: `_sync_task_to_forum()` wraps each task in try/except so one failure doesn't abort the whole sync cycle.
+- **In-process cycle serialization**: `incremental_sync()` / `full_sync()` / `initial_sync()` acquire a reentrant `self._sync_lock` (`RLock`). The watcher thread's periodic cycle and the `kanban_forum_sync_resync` tool / `/kanban-forum-sync sync` (which now run in the **same** gateway process via the shared singleton) can no longer overlap, preventing duplicate comment/log posts from interleaved check-then-act cursor advances. Reentrant so `full_sync()→initial_sync()` nesting works. Note: this is in-process only — two syncers pointed at the **same** DB across processes still share state files with no cross-process lock (see open questions).
 
 ## Hermes plugin API notes
 
@@ -154,7 +181,7 @@ Forum-only tags are normalized before any Kanban write: `Backlog` → `triage`, 
 
 **`register_cli_command` signature:** `register_cli_command(name, help, setup_fn, ...)` — `help` is a required second positional argument.
 
-**Slash command handler signature differs from CLI:** When implementing the planned `/kanban-forum-sync` slash command via `ctx.register_command()`, the handler receives a raw argument string (not an argparse Namespace):
+**Slash command handler signature differs from CLI:** The `/kanban-forum-sync` command registered via `ctx.register_command()` receives a raw argument string (not an argparse Namespace):
 ```python
 def handler(raw_args: str) -> str: ...  # can also be async
 ctx.register_command(name="kanban-forum-sync", handler=handler, description="...")
@@ -163,17 +190,15 @@ This is distinct from `ctx.register_cli_command()` which uses argparse subparser
 
 **`ctx.dispatch_tool()`** — available to invoke any Hermes tool (including `kanban_*` tools) from within the plugin, with full approval pipeline and workspace wiring. Useful if future features need to interact with the Kanban agent surface rather than the DB directly.
 
-**`ctx.inject_message(content, role="user")`** — queues a message into the active agent conversation (starts a new turn if idle, interrupts if mid-turn). This is the correct mechanism for the currently-missing "Hermes agent notification on tag changes" feature: when `_sync_forum_tags()` updates a Kanban status, call `ctx.inject_message()` to notify the agent. Returns `False` in gateway mode with no CLI reference.
+**`ctx.inject_message(content, role="user")`** — queues a message into the active agent conversation (starts a new turn if idle, interrupts if mid-turn). This plugin uses it when `_sync_forum_tags()` updates a Kanban status from a Discord tag change. Returns `False` in gateway mode with no CLI reference.
 
 **`pre_llm_call` context injection** — a hook that can inject text into the current turn's user message by returning `{"context": "..."}`. Not used now, but could surface sync status or pending Forum comments into agent conversations.
 
 **`pre_gateway_dispatch` hook** — fires when the gateway receives a message; can skip, rewrite, or allow. Not used now but available if the plugin needs to intercept Discord gateway events directly.
 
-## What's not yet implemented (Phase 3)
+## What's not yet implemented
 
-- Discord slash command `/kanban-forum-sync` — designed in the spec (`ctx.register_command()`), not wired in current `__init__.py`
 - `hermes kanban-forum-sync setup` — guided setup subcommand
-- Hermes agent notification on tag changes (Phase 2 partial: DB is updated, but no agent event is emitted)
 - Multiple Forum channel support
 
 ## Open design questions

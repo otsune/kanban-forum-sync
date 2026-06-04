@@ -1,31 +1,13 @@
 name: kanban-forum-sync
-version: "1.0.0"
+version: "1.1.0"
 description: Sync Hermes Kanban tasks to Discord Forum channels
 author: otsune
+provides_tools:
+  - kanban_forum_sync_status
+  - kanban_forum_sync_resync
 requires_env:
   - name: FORUM_SYNC_BOT_TOKEN
     description: >-
       Discord Bot Token (from Discord Developer Portal).
       未設定の場合は DISCORD_BOT_TOKEN をフォールバックとして使用。
     secret: true
-  - name: FORUM_SYNC_CHANNEL_ID
-    description: >-
-      Discord Forum Channel ID (snowflake).
-      Optional: if unset or empty, bot will auto-discover or create a forum named
-      'kanban' / 'task-board' in the first accessible guild.
-  - name: FORUM_SYNC_POLL_INTERVAL
-    description: "Polling interval in seconds (default: 15)"
-    default: "15"
-  - name: FORUM_SYNC_LANG
-    description: >-
-      Discord Forum タグの言語設定。"en"（デフォルト）または "ja"。
-      "ja" にすると Forum タグ名が日本語になる（例: Running → 進行中）。
-      既存の英語タグがある場合は Discord 側で手動削除が必要。
-    default: "en"
-  - name: FORUM_SYNC_EVENT_DRIVEN
-    description: >-
-      Set to 1 to enable inotify-based event-driven sync (Linux only).
-      Reacts to kanban.db writes instantly instead of waiting for POLL_INTERVAL.
-      POLL_INTERVAL becomes the fallback timeout for Phase 2 Discord polling.
-      Falls back to interval-based sync automatically if inotify is unavailable.
-    default: "0"

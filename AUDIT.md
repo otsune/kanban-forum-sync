@@ -127,12 +127,13 @@ Severity counts: **2 critical, 4 high, 4 medium, 4 low.**
 
 - **L1** — Custom `PermissionError` (`discord_forum.py:35`) shadows the builtin; rename to
   `DiscordPermissionError` to avoid confusion in `syncer.py`.
-- **L2** — `cli_status`/`cli_stop` call `_get_syncer()` which raises a bare traceback if no token is
-  set (`__init__.py:24-27`); wrap CLI handlers to print a friendly message.
+- **L2** — Resolved: CLI handlers now go through `service.get_syncer_or_none()` and print a
+  friendly unavailable message when the bot token is missing.
 - **L3** — Doc drift: README status-mapping emojis (🟡 Triage, ⬜ Todo…) don't match the code
   (`_LOCALE_DATA`: 🩺 Triage, 📝 Todo…), and README presents `scheduled`/`review` as if standard.
-- **L4** — No tests or linter configured (`CLAUDE.md:28`). Add smoke tests for `_build_tag_tables`,
-  message-ordering/cursor logic, and JSON round-trip/corruption recovery.
+- **L4** — Partially resolved: stdlib `unittest` coverage exists in `tests/test_sync_safety.py`
+  for tag tables, message-ordering/cursor logic, JSON corruption recovery, tool registration,
+  slash routing, and tag-change notification. No linter is configured.
 
 ---
 
