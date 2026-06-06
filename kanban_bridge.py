@@ -15,7 +15,6 @@ _UNSET = object()
 # フォールバック用の既定 DB パス（コアの解決 API が使えない場合のみ使用）。
 KANBAN_DB_PATH = os.path.expanduser("~/.hermes/kanban.db")
 
-TASK_COLS = "id, title, body, status, priority, assignee, created_at, completed_at"
 KANBAN_STATUSES = {"triage", "todo", "ready", "running", "blocked", "done", "archived"}
 
 
@@ -68,7 +67,8 @@ class KanbanBridge:
         conn = self._connect()
         try:
             rows = conn.execute(
-                f"SELECT {TASK_COLS} FROM tasks"
+                "SELECT id, title, body, status, priority, assignee, "
+                "created_at, completed_at FROM tasks"
             ).fetchall()
             return [dict(r) for r in rows]
         finally:
@@ -98,7 +98,8 @@ class KanbanBridge:
         conn = self._connect()
         try:
             row = conn.execute(
-                f"SELECT {TASK_COLS} FROM tasks WHERE id = ?",
+                "SELECT id, title, body, status, priority, assignee, "
+                "created_at, completed_at FROM tasks WHERE id = ?",
                 (task_id,),
             ).fetchone()
             return dict(row) if row else None

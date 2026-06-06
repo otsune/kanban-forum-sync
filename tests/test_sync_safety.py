@@ -301,6 +301,15 @@ class SyncSafetyTests(unittest.TestCase):
         self.assertEqual(ctx.exception.http_code, 429)
         self.assertIn("Rate limit retries exhausted", str(ctx.exception))
 
+    def test_request_rejects_non_discord_url(self):
+        # A path that would steer the request off the Discord API host (host
+        # confusion / scheme swap) must be refused before any network call.
+        client = DiscordForumClient("token", channel_id=1)
+        with mock.patch.object(discord_forum, "urlopen") as urlopen:
+            with self.assertRaises(discord_forum.DiscordForumError):
+                client._request("GET", "@evil.com/etc/passwd")
+            urlopen.assert_not_called()
+
     def test_tool_handlers_return_json_and_never_raise_for_basic_paths(self):
         class FakeToolSyncer:
             channel_id = 42

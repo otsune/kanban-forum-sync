@@ -114,6 +114,12 @@ class DiscordForumClient:
 
     def _request(self, method: str, path: str, body: dict = None) -> dict:
         url = f"{BASE_URL}{path}"
+        # Defense-in-depth: every request must target the Discord REST API over
+        # https. `path` is built internally from snowflake IDs today, but this
+        # guard guarantees a future/untrusted `path` can never redirect urlopen
+        # to file://, http://, or another host.
+        if not url.startswith(BASE_URL + "/") and url != BASE_URL:
+            raise DiscordForumError(f"refusing non-Discord URL: {url}")
         data = json.dumps(body).encode() if body else None
         hard_attempt = 0
         rate_attempt = 0
@@ -122,7 +128,9 @@ class DiscordForumClient:
             self._wait_for_request_slot()
             req = Request(url, data=data, headers=self._headers, method=method)
             try:
-                with urlopen(req, timeout=30, context=_SSL_CONTEXT) as resp:
+                # URL is guarded above to start with BASE_URL (https://discord.com),
+                # so no file://, http://, or host swap can reach urlopen.
+                with urlopen(req, timeout=30, context=_SSL_CONTEXT) as resp:  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
                     self._note_ratelimit_headers(resp.headers)
                     raw = resp.read().decode()
                     if not raw:
