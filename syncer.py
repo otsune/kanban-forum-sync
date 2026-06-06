@@ -1,6 +1,7 @@
 """Kanban ↔ Discord Forum 同期のコアロジック。
 task_events ベースの変更検出でポーリング。"""
 
+import fcntl
 import json
 import os
 import re
@@ -18,7 +19,10 @@ from .discord_forum import (
     FORUM_CHANNEL_TYPE,
 )
 from .kanban_bridge import KanbanBridge
-from .models import SyncState, SyncMap, SyncOriginTracker, ThreadMetaTracker, db_slug
+from .models import (
+    SyncState, SyncMap, SyncOriginTracker, ThreadMetaTracker,
+    db_slug, watcher_lock_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -280,6 +284,9 @@ class KanbanForumSyncer:
         self._bot_user_id: Optional[str] = None
         self._rate_backoff = 0
         self._last_cycle_completed_at = 0.0
+        # 「1 DB 1 watcher」を強制するクロスプロセスロックのファイルハンドル。
+        # 取得できた gateway プロセスだけが同期ループを回す（他は休眠）。
+        self._db_lock_file = None
 
     @property
     def channel_id(self) -> Optional[int]:
@@ -755,6 +762,31 @@ class KanbanForumSyncer:
         )
         return True
 
+    def _mark_thread_imported(self, thread_id: int, task_id: str,
+                              original_name: str) -> None:
+        """取り込んだ Forum スレッドに恒久的な de-dup マーク（task-<id> 接頭辞）を付ける。
+
+        sync_map は揮発的で、状態ファイル消失や別プロセスでの再取り込みにより
+        同じスレッドから重複タスクが作られうる（実害として確認済みの暴走）。
+        スレッド名を ``task-<id>: <元タイトル>`` にリネームしておくと、以降は
+        ``_sync_forum_new_threads`` の ``task-`` 接頭辞検出と
+        ``_recover_orphaned_thread`` の再リンクが効き、重複生成されない。
+        Discord のスレッド名上限は 100 文字なので切り詰める。
+
+        リネームに失敗しても sync_map には既に登録済みなので、同一プロセス内では
+        重複しない（マークはあくまでクロスプロセス／状態消失への保険）。
+        """
+        marked = f"task-{task_id}: {original_name}"[:100]
+        try:
+            self.discord.update_thread(thread_id, name=marked)
+            logger.info("Marked imported thread %s as '%s'", thread_id, marked)
+        except Exception as e:
+            logger.warning(
+                "Failed to mark imported thread %s as task-%s "
+                "(de-dup relies on sync_map until then): %s",
+                thread_id, task_id, e,
+            )
+
     def _fetch_forum_threads(self) -> dict[int, dict]:
         """Forum 配下の active + archived thread を 1 サイクル 1 回だけ取得する。"""
         threads_by_id: dict[int, dict] = {}
@@ -842,6 +874,7 @@ class KanbanForumSyncer:
             if task_id:
                 self._sync_map.set(task_id, thread_id)
                 self._origin_tracker.set_origin(task_id, "forum")
+                self._mark_thread_imported(thread_id, task_id, thread_name)
                 self._state.task_count += 1
                 self._state.forum_task_count += 1
                 new_count += 1
@@ -1182,8 +1215,92 @@ class KanbanForumSyncer:
 
     # ---- Thread lifecycle ----
 
+    def _acquire_db_lock(self) -> bool:
+        """この DB を同期する権利を表すクロスプロセス排他ロックを取得する。
+
+        複数の Hermes ゲートウェイ（プロファイル）が同じ既定 kanban.db に対して
+        それぞれ watcher を起動すると、共有 JSON 状態ファイルを奪い合い、各
+        プロセスが同じ Forum スレッドを「新規」と誤認して重複タスク・重複スレッドを
+        無限増殖させる（実害として確認済み）。flock(LOCK_EX|LOCK_NB) で
+        「1 DB 1 watcher」を強制する。取得できなければ False（呼び出し側で休眠）。
+
+        ロックは gateway プロセスの寿命の間保持される。プロセスがクラッシュ
+        しても OS が flock を解放するため stale ロックは残らない。
+        """
+        if self._db_lock_file is not None:
+            return True
+        path = watcher_lock_path(db_slug(self.kanban.db_path))
+        try:
+            f = open(path, "a+")
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as e:
+            logger.info("Could not acquire watcher lock %s: %s", path, e)
+            try:
+                f.close()
+            except Exception:
+                pass
+            return False
+        try:
+            f.seek(0)
+            f.truncate()
+            f.write(str(os.getpid()))
+            f.flush()
+        except Exception:
+            pass
+        self._db_lock_file = f
+        logger.info(
+            "Acquired watcher lock for DB %s (pid %s)",
+            self.kanban.db_path, os.getpid(),
+        )
+        return True
+
+    def _release_db_lock(self) -> None:
+        f = self._db_lock_file
+        if f is None:
+            return
+        try:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        try:
+            f.close()
+        except Exception:
+            pass
+        self._db_lock_file = None
+
+    def _hold_db_lock(self) -> bool:
+        """このサイクルで同期してよいか（DB ロックを保持しているか）を返す。
+
+        毎サイクル取得を試みる設計。別 watcher が保持中なら False（このサイクルは
+        休眠）。保持プロセスが落ちれば次サイクルで自動的に引き継ぐので、
+        「最初に取れなければ永久に止まる」問題を避けつつ、flock により
+        「同時に同期するのは常に1プロセルだけ」を保証する（暴走防止の本丸）。
+        """
+        if self._acquire_db_lock():
+            if self._state.state == "dormant":
+                logger.info(
+                    "Acquired watcher lock; resuming sync for DB %s",
+                    self.kanban.db_path,
+                )
+                self._state.state = "running"
+            return True
+        if self._state.state != "dormant":
+            self._state.state = "dormant"
+            logger.info(
+                "Another watcher holds the lock for DB %s; staying dormant this "
+                "cycle (will retry; one syncer per DB is enforced).",
+                self.kanban.db_path,
+            )
+        return False
+
     def start(self):
-        """バックグラウンドスレッドでポーリングループを開始"""
+        """バックグラウンドスレッドでポーリングループを開始。
+
+        ロック取得はループ内（毎サイクル `_hold_db_lock`）で行う。ここで取れ
+        なくてもスレッドは起動し、休眠しつつ取得を試み続ける。これにより、
+        先にロックを握った短命プロセス（worker 等）が終了したら、永続
+        gateway がロックを引き継いで同期を継続できる。
+        """
         if self._thread and self._thread.is_alive():
             logger.warning("Syncer already running")
             return
@@ -1202,6 +1319,7 @@ class KanbanForumSyncer:
         self._stop_event.set()
         if self._thread:
             self._thread.join(timeout=10)
+        self._release_db_lock()
         self._state.state = "stopped"
         logger.info("Syncer stopped")
 
@@ -1214,6 +1332,11 @@ class KanbanForumSyncer:
     def _prepare_initial_sync(self) -> bool:
         delay = max(1, min(self.poll_interval, 30))
         while not self._stop_event.is_set():
+            # 先にロックを確保（取れるまで休眠して待つ）。これを満たさないと
+            # 別 watcher と同時に initial_sync して重複スレッドを作ってしまう。
+            if not self._hold_db_lock():
+                self._stop_event.wait(min(delay, self.poll_interval))
+                continue
             if not self._resolve_forum_channel():
                 self._state.state = "error"
                 logger.error(
@@ -1241,6 +1364,10 @@ class KanbanForumSyncer:
             return
 
         while not self._stop_event.is_set():
+            # 毎サイクル、ロック保持を確認。別 watcher が握っていれば休眠。
+            if not self._hold_db_lock():
+                self._stop_event.wait(self.poll_interval)
+                continue
             try:
                 self.incremental_sync()
                 self._rate_backoff = 0
@@ -1272,6 +1399,11 @@ class KanbanForumSyncer:
                 watcher.wait(timeout=self.poll_interval)
                 if self._stop_event.is_set():
                     break
+
+                # 毎サイクル、ロック保持を確認。別 watcher が握っていれば休眠。
+                if not self._hold_db_lock():
+                    self._stop_event.wait(self.poll_interval)
+                    continue
 
                 elapsed = time.monotonic() - self._last_cycle_completed_at
                 if 0 < elapsed < self._MIN_CYCLE_INTERVAL:

@@ -71,6 +71,9 @@ class CreateTaskAssigneePrecedenceTest(unittest.TestCase):
             return {"task_id": "42"}
 
         b._dispatch_kanban_tool = fake_dispatch
+        # 既知プロファイル検証は別テストで扱う。ここは解決順だけを検証したいので
+        # 空集合（= 検証スキップ）にして任意の assignee 名を通す。
+        b._known_profiles = lambda: set()
         return b, captured
 
     def test_explicit_assignee_wins(self):
@@ -113,6 +116,70 @@ class CreateTaskAssigneePrecedenceTest(unittest.TestCase):
             os.environ.pop("HERMES_PROFILE", None)
             self.assertIsNone(b.create_task("t"))
         self.assertNotIn("args", cap)  # 解決不能なら dispatch しない
+
+
+class CreateTaskAssigneeValidationTest(unittest.TestCase):
+    """create_task(): 実在プロファイルに限定する検証＋フォールバック。"""
+
+    def _bridge_capturing(self):
+        b = _bridge()
+        captured = {}
+
+        def fake_dispatch(tool, args):
+            captured["tool"] = tool
+            captured["args"] = args
+            return {"task_id": "42"}
+
+        b._dispatch_kanban_tool = fake_dispatch
+        return b, captured
+
+    def test_unknown_assignee_skipped_falls_back_to_valid(self):
+        # FORUM_SYNC_DEFAULT_ASSIGNEE=otsune（実在しない）→ 弾いて config の main へ。
+        b, cap = self._bridge_capturing()
+        b._known_profiles = lambda: {"main"}
+        b._config_default_assignee = lambda: "main"
+        with mock.patch.dict(os.environ, {"FORUM_SYNC_DEFAULT_ASSIGNEE": "otsune"}):
+            os.environ.pop("HERMES_PROFILE", None)
+            self.assertEqual(b.create_task("t"), "42")
+        self.assertEqual(cap["args"]["assignee"], "main")
+
+    def test_explicit_unknown_skipped_for_valid_env(self):
+        b, cap = self._bridge_capturing()
+        b._known_profiles = lambda: {"url_memo"}
+        b._config_default_assignee = lambda: None
+        with mock.patch.dict(os.environ, {"FORUM_SYNC_DEFAULT_ASSIGNEE": "url_memo"}):
+            os.environ.pop("HERMES_PROFILE", None)
+            self.assertEqual(b.create_task("t", assignee="otsune"), "42")
+        self.assertEqual(cap["args"]["assignee"], "url_memo")
+
+    def test_case_insensitive_match(self):
+        b, cap = self._bridge_capturing()
+        b._known_profiles = lambda: {"main"}
+        b._config_default_assignee = lambda: None
+        with mock.patch.dict(os.environ, {"FORUM_SYNC_DEFAULT_ASSIGNEE": "Main"}):
+            os.environ.pop("HERMES_PROFILE", None)
+            self.assertEqual(b.create_task("t"), "42")
+        self.assertEqual(cap["args"]["assignee"], "Main")
+
+    def test_all_invalid_returns_none_without_dispatch(self):
+        b, cap = self._bridge_capturing()
+        b._known_profiles = lambda: {"main"}
+        b._config_default_assignee = lambda: None
+        with mock.patch.dict(os.environ,
+                             {"FORUM_SYNC_DEFAULT_ASSIGNEE": "otsune",
+                              "HERMES_PROFILE": "ghost"}):
+            self.assertIsNone(b.create_task("t"))
+        self.assertNotIn("args", cap)
+
+    def test_empty_known_set_disables_validation(self):
+        # プロファイル集合が取得できない場合は検証せず従来動作（任意名を通す）。
+        b, cap = self._bridge_capturing()
+        b._known_profiles = lambda: set()
+        b._config_default_assignee = lambda: None
+        with mock.patch.dict(os.environ, {"FORUM_SYNC_DEFAULT_ASSIGNEE": "otsune"}):
+            os.environ.pop("HERMES_PROFILE", None)
+            self.assertEqual(b.create_task("t"), "42")
+        self.assertEqual(cap["args"]["assignee"], "otsune")
 
 
 if __name__ == "__main__":

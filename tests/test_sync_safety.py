@@ -252,6 +252,9 @@ class SyncSafetyTests(unittest.TestCase):
     def test_kanban_writes_go_through_dispatch_tool(self):
         ctx = FakeCtx()
         bridge = KanbanBridge(ctx=ctx)
+        # このテストは dispatch 経路の検証が主眼。プロファイル検証は別テストで
+        # 扱うので空集合（検証スキップ）にして explicit assignee を素通しさせる。
+        bridge._known_profiles = lambda: set()
 
         self.assertTrue(bridge.add_comment("t1", "alice", "hello"))
         task_id = bridge.create_task("Forum title", "body", assignee="router")

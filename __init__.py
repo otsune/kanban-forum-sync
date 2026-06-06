@@ -6,9 +6,32 @@ register(ctx) で Hermes プラグインシステムに登録。
 """
 
 import logging
+import os
+import sys
 from . import schemas, service, tools
 
 logger = logging.getLogger(__name__)
+
+
+def _is_dedicated_gateway() -> bool:
+    """この hermes プロセスが「同期 watcher を回すべき専用ゲートウェイ」かを判定する。
+
+    Hermes のプラグインは、専用ゲートウェイだけでなく対話 TUI・各 kanban worker・
+    各種 CLI 呼び出しなど **あらゆる** プロセスで読み込まれ、その全てが
+    register() で watcher を自動起動してしまう。複数 watcher が同じ DB を奪い合うと
+    重複タスク・重複スレッドの暴走になる（実害として確認済み）。
+
+    そこで watcher を起動するのは `... gateway run` 系の専用ゲートウェイに限定する。
+    対話 TUI（tui_gateway / `hermes --tui`）・worker（`... chat ... work kanban`）・
+    CLI は watcher を起動しない。複数ゲートウェイが同一 DB を見る場合の最終防衛は
+    syncer 側の DB ロック（watcher.lock）が担う。
+
+    緊急避難として ``FORUM_SYNC_FORCE_WATCHER=1`` で強制起動も可能。
+    """
+    if os.environ.get("FORUM_SYNC_FORCE_WATCHER") == "1":
+        return True
+    argv = sys.argv or []
+    return "gateway" in argv and "run" in argv
 
 
 # ---- CLI サブコマンド ----
@@ -148,6 +171,16 @@ def register(ctx):
         handler=_slash_handler,
         description="Kanban ↔ Discord Forum sync: status|sync|start|stop",
     )
+    if not _is_dedicated_gateway():
+        logger.info(
+            "kanban-forum-sync: not a dedicated `gateway run` process "
+            "(argv=%s); watcher NOT auto-started. The sync watcher runs only "
+            "in the dedicated gateway to avoid multiple competing watchers. "
+            "Set FORUM_SYNC_FORCE_WATCHER=1 to override.",
+            (sys.argv or [])[:4],
+        )
+        return
+
     try:
         syncer = service.get_syncer()
         syncer.start()

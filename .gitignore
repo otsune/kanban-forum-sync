@@ -10,3 +10,7 @@ origin_map.json
 origin_map_*.json
 *.json.lock
 *.json.tmp.*
+
+# Cross-process watcher ownership lock (per-DB slug variants included)
+watcher.lock
+watcher_*.lock

@@ -52,6 +52,8 @@ class KanbanBridge:
         # （config 変更の反映は bridge 再生成＝gateway 再起動時。default_assignee は
         #   稀にしか変わらないため許容。）
         self._default_assignee_cache: Any = _UNSET
+        # ディスク上の有効プロファイル集合（= 有効な assignee）のキャッシュ。
+        self._known_profiles_cache: Any = _UNSET
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=120)
@@ -241,6 +243,30 @@ class KanbanBridge:
         self._default_assignee_cache = result
         return result
 
+    def _known_profiles(self) -> set:
+        """ディスク上の有効なプロファイル名（= 有効な assignee）の集合を返す。
+
+        Hermes コアの ``list_profiles_on_disk()`` に委譲する
+        （``~/.hermes/profiles/<name>`` + 既定の ``default``）。forum→kanban の
+        タスク作成時に assignee が実在プロファイルかを検証するために使う。
+        実在しない assignee（例: ``otsune``）を渡すと ``kanban_create`` が
+        エラーになり、同期が固まる/暴走の一因になるため、無効な候補は弾く。
+
+        取得できない/空のときは空集合を返す。呼び出し側はその場合に検証を
+        スキップして従来動作を保つ（コア未導入のテスト環境など）。
+        結果はインスタンス寿命でキャッシュ（``__init__`` 参照）。
+        """
+        if self._known_profiles_cache is not _UNSET:
+            return self._known_profiles_cache
+        profiles: set = set()
+        try:
+            from hermes_cli.kanban_db import list_profiles_on_disk
+            profiles = set(list_profiles_on_disk())
+        except Exception as e:
+            logger.debug("Failed to list profiles on disk: %s", e)
+        self._known_profiles_cache = profiles
+        return profiles
+
     def create_task(self, title: str, body: str = "",
                     status: str = "triage",
                     assignee: Optional[str] = None) -> Optional[str]:
@@ -256,17 +282,41 @@ class KanbanBridge:
             logger.warning("create_task: unsupported status %r; using triage", status)
             status = "triage"
 
-        resolved_assignee = (
-            assignee
-            or os.environ.get("FORUM_SYNC_DEFAULT_ASSIGNEE")
-            or self._config_default_assignee()
-            or os.environ.get("HERMES_PROFILE")
-        )
+        # assignee 解決順: explicit > env > config > HERMES_PROFILE。
+        # ただし実在するプロファイル（_known_profiles）に限定する。実在しない
+        # assignee（例: "otsune"）を渡すと kanban_create がエラーになり同期が
+        # 止まる/暴走するため、無効な候補はスキップして次の候補へフォールバックする。
+        # （プロファイル集合が取得できない場合は検証を行わず従来動作を保つ。）
+        known = self._known_profiles()
+        candidates = [
+            assignee,
+            os.environ.get("FORUM_SYNC_DEFAULT_ASSIGNEE"),
+            self._config_default_assignee(),
+            os.environ.get("HERMES_PROFILE"),
+        ]
+        resolved_assignee: Optional[str] = None
+        rejected: list[str] = []
+        for cand in candidates:
+            if not cand or not cand.strip():
+                continue
+            name = cand.strip()
+            if known and name not in known and name.lower() not in known:
+                rejected.append(name)
+                continue
+            resolved_assignee = name
+            break
+        if rejected:
+            logger.warning(
+                "create_task: ignoring assignee(s) %s — not a known Hermes "
+                "profile. Valid profiles: %s",
+                rejected, sorted(known) or "(unknown)",
+            )
         if not resolved_assignee:
             logger.error(
-                "create_task requires assignee for kanban_create; set "
-                "config.yaml の kanban.default_assignee か "
-                "FORUM_SYNC_DEFAULT_ASSIGNEE 環境変数"
+                "create_task requires a valid profile assignee for kanban_create. "
+                "Set kanban.default_assignee / FORUM_SYNC_DEFAULT_ASSIGNEE to one "
+                "of: %s",
+                sorted(known) or "(create a profile with `hermes -p <name> setup`)",
             )
             return None
 

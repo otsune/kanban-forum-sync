@@ -12,6 +12,7 @@ from typing import Optional
 _PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 SYNC_MAP_PATH = os.path.join(_PLUGIN_DIR, "sync_map.json")
 THREAD_META_PATH = os.path.join(_PLUGIN_DIR, "thread_meta.json")
+WATCHER_LOCK_PATH = os.path.join(_PLUGIN_DIR, "watcher.lock")
 
 # 既定 DB（~/.hermes/kanban.db）のパス。これと一致する場合は slug 空＝従来ファイル名。
 _DEFAULT_KANBAN_DB = os.path.expanduser("~/.hermes/kanban.db")
@@ -46,6 +47,15 @@ def _slugged(path: str, slug: str) -> str:
         return path
     root, ext = os.path.splitext(path)
     return f"{root}_{slug}{ext}"
+
+
+def watcher_lock_path(slug: str = "") -> str:
+    """DB(slug) 単位の watcher 所有ロックのパス。
+
+    「1 DB につき syncer 1台」をクロスプロセスで強制するための flock 対象。
+    別 DB（別 slug）は別ロックなので独立に動ける。
+    """
+    return _slugged(WATCHER_LOCK_PATH, slug)
 
 
 def _load_json_dict(path: str) -> dict:
