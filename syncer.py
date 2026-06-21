@@ -83,6 +83,10 @@ STATUS_TO_TAG, TAG_TO_STATUS, STATUS_TAG_EMOJI = _build_tag_tables(_LANG)
 # Statuses that trigger thread archiving (locale-independent)
 ARCHIVE_STATUSES = {"done", "archived"}
 
+# Discord message body hard limit; thread creation content must fit within it.
+_DISCORD_CONTENT_LIMIT = 2000
+_TRUNCATION_SUFFIX = "\n…(truncated)"
+
 # task_events の種別のうち Discord に通知するもの
 _WORKER_LOG_KINDS = [
     "blocked", "unblocked",
@@ -994,20 +998,32 @@ class KanbanForumSyncer:
         return f"task-{task['id']}: {task['title']}"
 
     def _thread_content(self, task: dict) -> str:
-        lines = [
-            f"**{task['title']}**",
-            f"Status: **{task['status']}**",
-        ]
+        def build(body: str) -> str:
+            lines = [
+                f"**{task['title']}**",
+                f"Status: **{task['status']}**",
+            ]
+            if body:
+                lines.append(f"\n{body}")
 
-        if task.get("body"):
-            lines.append(f"\n{task['body']}")
+            details = [f"Priority: {task.get('priority', '—')}"]
+            if task.get("assignee"):
+                details.append(f"Assignee: {task['assignee']}")
+            lines.append("\n" + " | ".join(details))
 
-        details = [f"Priority: {task.get('priority', '—')}"]
-        if task.get("assignee"):
-            details.append(f"Assignee: {task['assignee']}")
-        lines.append("\n" + " | ".join(details))
+            return "\n".join(lines)
 
-        return "\n".join(lines)
+        body = task.get("body") or ""
+        content = build(body)
+        if len(content) <= _DISCORD_CONTENT_LIMIT:
+            return content
+
+        # Long task bodies must be truncated to satisfy Discord's per-message
+        # length cap, otherwise create_thread() fails with 400 and the task
+        # never gets synced (see t_bea4ec84 incident).
+        overflow = len(content) - _DISCORD_CONTENT_LIMIT + len(_TRUNCATION_SUFFIX)
+        body = body[: max(len(body) - overflow, 0)] + _TRUNCATION_SUFFIX
+        return build(body)[:_DISCORD_CONTENT_LIMIT]
 
     # ---- Sync logic ----
 
