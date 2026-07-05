@@ -14,3 +14,10 @@ origin_map_*.json
 # Cross-process watcher ownership lock (per-DB slug variants included)
 watcher.lock
 watcher_*.lock
+
+# Local tool state (not part of the plugin)
+.serena/
+.tokensave/
+
+# Test run logs
+tests/test_run_*.log
