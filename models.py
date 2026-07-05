@@ -223,19 +223,22 @@ class ThreadMetaTracker:
     def _save(self):
         _atomic_save_json(self._path, self._data, indent=2, sort_keys=True)
 
+    def _get_field(self, thread_id: int, field: str) -> int:
+        with self._lock:
+            return self._data.get(str(thread_id), {}).get(field, 0)
+
+    def _set_field(self, thread_id: int, field: str, value: int) -> None:
+        with self._lock:
+            self._data.setdefault(str(thread_id), {})[field] = value
+            self._save()
+
     def get_last_message_id(self, thread_id: int) -> int:
         """追跡しているスレッドの最後に処理したメッセージID"""
-        with self._lock:
-            return self._data.get(str(thread_id), {}).get("last_message_id", 0)
+        return self._get_field(thread_id, "last_message_id")
 
     def set_last_message_id(self, thread_id: int, message_id: int):
         """最後に処理したメッセージIDを記録"""
-        with self._lock:
-            key = str(thread_id)
-            if key not in self._data:
-                self._data[key] = {}
-            self._data[key]["last_message_id"] = message_id
-            self._save()
+        self._set_field(thread_id, "last_message_id", message_id)
 
     def remove(self, thread_id: int):
         """スレッドのメタデータを削除（スレッド削除時など）"""
@@ -251,42 +254,24 @@ class ThreadMetaTracker:
 
     def get_last_comment_id(self, thread_id: int) -> int:
         """Kanban→Discord で最後に投稿したコメントID"""
-        with self._lock:
-            return self._data.get(str(thread_id), {}).get("last_comment_id", 0)
+        return self._get_field(thread_id, "last_comment_id")
 
     def set_last_comment_id(self, thread_id: int, comment_id: int):
-        with self._lock:
-            key = str(thread_id)
-            if key not in self._data:
-                self._data[key] = {}
-            self._data[key]["last_comment_id"] = comment_id
-            self._save()
+        self._set_field(thread_id, "last_comment_id", comment_id)
 
     def get_last_kanban_event_id(self, thread_id: int) -> int:
         """Kanban→Discord で最後に投稿したイベントID"""
-        with self._lock:
-            return self._data.get(str(thread_id), {}).get("last_kanban_event_id", 0)
+        return self._get_field(thread_id, "last_kanban_event_id")
 
     def set_last_kanban_event_id(self, thread_id: int, event_id: int):
-        with self._lock:
-            key = str(thread_id)
-            if key not in self._data:
-                self._data[key] = {}
-            self._data[key]["last_kanban_event_id"] = event_id
-            self._save()
+        self._set_field(thread_id, "last_kanban_event_id", event_id)
 
     def get_worker_log_count(self, thread_id: int) -> int:
         """既に Discord に投稿したワーカーログ発話ブロックの件数。"""
-        with self._lock:
-            return self._data.get(str(thread_id), {}).get("worker_log_count", 0)
+        return self._get_field(thread_id, "worker_log_count")
 
     def set_worker_log_count(self, thread_id: int, count: int):
-        with self._lock:
-            key = str(thread_id)
-            if key not in self._data:
-                self._data[key] = {}
-            self._data[key]["worker_log_count"] = count
-            self._save()
+        self._set_field(thread_id, "worker_log_count", count)
 
     def keys(self) -> list[int]:
         """全追跡スレッドID"""
