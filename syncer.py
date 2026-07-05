@@ -565,12 +565,12 @@ class KanbanForumSyncer:
                 messages = self.discord.get_thread_messages(
                     thread_id, after=after_param, limit=50
                 )
+            except NotFoundError:
+                logger.warning("Thread %s no longer exists; removing from sync_map", thread_id)
+                self._drop_stale_thread(thread_id)
+                continue
             except Exception as e:
-                if "Resource not found" in str(e):
-                    logger.warning("Thread %s no longer exists; removing from sync_map", thread_id)
-                    self._drop_stale_thread(thread_id)
-                else:
-                    logger.warning("Failed to fetch messages for thread %s: %s", thread_id, e)
+                logger.warning("Failed to fetch messages for thread %s: %s", thread_id, e)
                 continue
 
             if not messages:
@@ -645,12 +645,12 @@ class KanbanForumSyncer:
             if threads_by_id is None:
                 try:
                     thread = self.discord.get_channel_by_id(thread_id)
+                except NotFoundError:
+                    logger.warning("Thread %s no longer exists; removing from sync_map", thread_id)
+                    self._drop_stale_thread(thread_id)
+                    continue
                 except Exception as e:
-                    if "Resource not found" in str(e):
-                        logger.warning("Thread %s no longer exists; removing from sync_map", thread_id)
-                        self._drop_stale_thread(thread_id)
-                    else:
-                        logger.warning("Failed to fetch thread %s: %s", thread_id, e)
+                    logger.warning("Failed to fetch thread %s: %s", thread_id, e)
                     continue
             elif thread is None:
                 # 共有リストは archived 先頭 50 件までしか含まないため、生きている
@@ -752,13 +752,14 @@ class KanbanForumSyncer:
         # スレッドが実際に Discord 上でアクセス可能か確認してからリンクする
         try:
             self.discord.get_channel_by_id(thread_id)
-        except Exception as e:
-            if "Resource not found" in str(e):
-                logger.debug(
-                    "Orphan recovery: thread %s returns 404; skipping (may be deleted)",
-                    thread_id,
-                )
-                return False
+        except NotFoundError:
+            logger.debug(
+                "Orphan recovery: thread %s returns 404; skipping (may be deleted)",
+                thread_id,
+            )
+            return False
+        except Exception:
+            pass
         self._sync_map.set(task_id, thread_id)
         logger.info(
             "Orphan recovery: re-linked thread %s → task-%s ('%s')",
@@ -922,12 +923,12 @@ class KanbanForumSyncer:
                     self._thread_meta.set_last_comment_id(thread_id, c["id"])
                     posted += 1
                     time.sleep(0.5)
+                except NotFoundError:
+                    logger.warning("Thread %s not found while posting comment; removing stale mapping", thread_id)
+                    self._drop_stale_thread(thread_id)
+                    break
                 except Exception as e:
-                    if "Resource not found" in str(e):
-                        logger.warning("Thread %s not found while posting comment; removing stale mapping", thread_id)
-                        self._drop_stale_thread(thread_id)
-                    else:
-                        logger.warning("Failed to post comment %s to thread %s: %s", c["id"], thread_id, e)
+                    logger.warning("Failed to post comment %s to thread %s: %s", c["id"], thread_id, e)
                     break
 
             # --- ワーカーログ ---
@@ -946,15 +947,15 @@ class KanbanForumSyncer:
                         posted += 1
                         time.sleep(0.5)
                     self._thread_meta.set_last_kanban_event_id(thread_id, ev["id"])
+                except NotFoundError:
+                    logger.warning(
+                        "Thread %s not found while posting event %s; removing stale mapping",
+                        thread_id, ev["id"],
+                    )
+                    self._drop_stale_thread(thread_id)
+                    break
                 except Exception as e:
-                    if "Resource not found" in str(e):
-                        logger.warning(
-                            "Thread %s not found while posting event %s; removing stale mapping",
-                            thread_id, ev["id"],
-                        )
-                        self._drop_stale_thread(thread_id)
-                    else:
-                        logger.warning("Failed to post event %s to thread %s: %s", ev["id"], thread_id, e)
+                    logger.warning("Failed to post event %s to thread %s: %s", ev["id"], thread_id, e)
                     break
 
             # --- ワーカー実行ログ（per-task テキストログの Hermes 発話） ---
@@ -976,17 +977,17 @@ class KanbanForumSyncer:
                         posted += 1
                         time.sleep(0.5)
                         self._thread_meta.set_worker_log_count(thread_id, idx + 1)
+                    except NotFoundError:
+                        logger.warning(
+                            "Thread %s not found while posting worker log; removing stale mapping",
+                            thread_id,
+                        )
+                        self._drop_stale_thread(thread_id)
+                        break
                     except Exception as e:
-                        if "Resource not found" in str(e):
-                            logger.warning(
-                                "Thread %s not found while posting worker log; removing stale mapping",
-                                thread_id,
-                            )
-                            self._drop_stale_thread(thread_id)
-                        else:
-                            logger.warning(
-                                "Failed to post worker log to thread %s: %s", thread_id, e
-                            )
+                        logger.warning(
+                            "Failed to post worker log to thread %s: %s", thread_id, e
+                        )
                         break
 
         if posted:
@@ -1180,7 +1181,7 @@ class KanbanForumSyncer:
         return ok
 
     def _is_rate_limit_cycle_error(self, exc: Exception) -> bool:
-        return getattr(exc, "http_code", None) == 429 or "Rate limit retries exhausted" in str(exc)
+        return isinstance(exc, RateLimitError) or getattr(exc, "http_code", None) == 429
 
     def _advance_rate_backoff(self) -> None:
         self._rate_backoff = min(
