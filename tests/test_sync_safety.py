@@ -322,6 +322,21 @@ class SyncSafetyTests(unittest.TestCase):
             def get_state(self):
                 return self.state
 
+            def status_dict(self):
+                state = self.state
+                return {
+                    "state": state.state,
+                    "channel_id": self.channel_id,
+                    "last_sync": state.last_sync,
+                    "last_event_id": state.last_event_id,
+                    "tasks": state.task_count,
+                    "comments": state.comment_count,
+                    "tag_syncs": state.tag_sync_count,
+                    "forum_tasks": state.forum_task_count,
+                    "errors": state.error_count,
+                    "last_error": state.last_error,
+                }
+
             def incremental_sync(self):
                 self.calls.append("incremental")
 
@@ -367,6 +382,21 @@ class SyncSafetyTests(unittest.TestCase):
 
             def get_state(self):
                 return self.state
+
+            def status_dict(self):
+                state = self.state
+                return {
+                    "state": state.state,
+                    "channel_id": self.channel_id,
+                    "last_sync": state.last_sync,
+                    "last_event_id": state.last_event_id,
+                    "tasks": state.task_count,
+                    "comments": state.comment_count,
+                    "tag_syncs": state.tag_sync_count,
+                    "forum_tasks": state.forum_task_count,
+                    "errors": state.error_count,
+                    "last_error": state.last_error,
+                }
 
             def full_sync(self):
                 self.calls.append("full")

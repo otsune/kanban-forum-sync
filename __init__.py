@@ -59,19 +59,19 @@ def cli_status(args):
     syncer = _get_syncer_or_print_error()
     if syncer is None:
         return
-    state = syncer.get_state()
-    ch = syncer.channel_id or "(auto)"
-    print(f"Syncer state: {state.state}")
+    status = syncer.status_dict()
+    ch = status["channel_id"] or "(auto)"
+    print(f"Syncer state: {status['state']}")
     print(f"Forum channel: {ch}")
-    print(f"Monitored tasks: {state.task_count}")
-    print(f"Last sync: {state.last_sync}")
-    print(f"Last event ID: {state.last_event_id}")
-    print(f"Errors: {state.error_count}")
-    print(f"Comments synced (Phase 2): {state.comment_count}")
-    print(f"Tag syncs (Phase 2): {state.tag_sync_count}")
-    print(f"Forum→Kanban tasks created (Phase 3): {state.forum_task_count}")
-    if state.last_error:
-        print(f"Last error: {state.last_error}")
+    print(f"Monitored tasks: {status['tasks']}")
+    print(f"Last sync: {status['last_sync']}")
+    print(f"Last event ID: {status['last_event_id']}")
+    print(f"Errors: {status['errors']}")
+    print(f"Comments synced (Phase 2): {status['comments']}")
+    print(f"Tag syncs (Phase 2): {status['tag_syncs']}")
+    print(f"Forum→Kanban tasks created (Phase 3): {status['forum_tasks']}")
+    if status["last_error"]:
+        print(f"Last error: {status['last_error']}")
 
 
 def cli_start(args):
@@ -110,14 +110,14 @@ def _get_syncer_or_print_error():
 
 
 def _format_status(syncer):
-    state = syncer.get_state()
+    status = syncer.status_dict()
     text = (
-        f"state={state.state} channel={syncer.channel_id or '(auto)'} "
-        f"tasks={state.task_count} comments={state.comment_count} "
-        f"tags={state.tag_sync_count} forum_tasks={state.forum_task_count}"
+        f"state={status['state']} channel={status['channel_id'] or '(auto)'} "
+        f"tasks={status['tasks']} comments={status['comments']} "
+        f"tags={status['tag_syncs']} forum_tasks={status['forum_tasks']}"
     )
-    if state.last_error:
-        text += f"\nlast_error={state.last_error}"
+    if status["last_error"]:
+        text += f"\nlast_error={status['last_error']}"
     return text
 
 

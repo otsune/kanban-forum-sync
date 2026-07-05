@@ -160,6 +160,22 @@ class KanbanForumSyncer:
     def get_state(self) -> SyncState:
         return self._state
 
+    def status_dict(self) -> dict:
+        """CLI / slash / agent tool が共有するステータス payload。"""
+        state = self._state
+        return {
+            "state": state.state,
+            "channel_id": self.channel_id,
+            "last_sync": state.last_sync,
+            "last_event_id": state.last_event_id,
+            "tasks": state.task_count,
+            "comments": state.comment_count,
+            "tag_syncs": state.tag_sync_count,
+            "forum_tasks": state.forum_task_count,
+            "errors": state.error_count,
+            "last_error": state.last_error,
+        }
+
     # ---- Forum channel auto-resolution ----
 
     def _set_channel(self, channel_id: int) -> None:
