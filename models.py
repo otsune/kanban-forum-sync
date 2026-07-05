@@ -93,20 +93,29 @@ def _atomic_save_json(path: str, data: dict, **dump_kwargs) -> None:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
-class SyncMap:
+class _JsonStore:
+    """flock + アトミック書き込みで永続化されるスレッドセーフな JSON dict。"""
+    _DUMP_KWARGS: dict = {"indent": 2}
+
+    def __init__(self, path: str, slug: str = ""):
+        self._path = _slugged(path, slug)
+        self._lock = threading.RLock()
+        self._data: dict = _load_json_dict(self._path)
+
+    def _save(self) -> None:
+        _atomic_save_json(self._path, self._data, **self._DUMP_KWARGS)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._data.clear()
+            self._save()
+
+
+class SyncMap(_JsonStore):
     """kanban_task_id (str) → discord_thread_id (int) の永続マッピング"""
 
     def __init__(self, path: str = SYNC_MAP_PATH, slug: str = ""):
-        self._path = _slugged(path, slug)
-        self._lock = threading.RLock()
-        self._data: dict[str, int] = {}
-        self._load()
-
-    def _load(self):
-        self._data = _load_json_dict(self._path)
-
-    def _save(self):
-        _atomic_save_json(self._path, self._data, indent=2)
+        super().__init__(path, slug)
 
     def get(self, kanban_id: str) -> Optional[int]:
         with self._lock:
@@ -120,11 +129,6 @@ class SyncMap:
     def remove(self, kanban_id: str):
         with self._lock:
             self._data.pop(kanban_id, None)
-            self._save()
-
-    def clear(self):
-        with self._lock:
-            self._data.clear()
             self._save()
 
     def items(self) -> dict[str, int]:
@@ -148,7 +152,7 @@ class SyncMap:
         return None
 
 
-class SyncOriginTracker:
+class SyncOriginTracker(_JsonStore):
     """タスクの起源を追跡。
 
     - ``kanban``: Kanban 側で作成されたタスク（通常の Phase 1 → Forum スレッド作成）
@@ -160,16 +164,7 @@ class SyncOriginTracker:
     ORIGIN_PATH = os.path.join(_PLUGIN_DIR, "origin_map.json")
 
     def __init__(self, path: str = ORIGIN_PATH, slug: str = ""):
-        self._path = _slugged(path, slug)
-        self._lock = threading.RLock()
-        self._data: dict[str, str] = {}  # task_id → "kanban" | "forum"
-        self._load()
-
-    def _load(self):
-        self._data = _load_json_dict(self._path)
-
-    def _save(self):
-        _atomic_save_json(self._path, self._data, indent=2)
+        super().__init__(path, slug)
 
     def set_origin(self, task_id: str, origin: str):
         with self._lock:
@@ -182,11 +177,6 @@ class SyncOriginTracker:
 
     def is_forum_sourced(self, task_id: str) -> bool:
         return self.get_origin(task_id) == "forum"
-
-    def clear(self):
-        with self._lock:
-            self._data.clear()
-            self._save()
 
 
 class SyncState:
@@ -204,24 +194,17 @@ class SyncState:
         self.forum_task_count: int = 0  # Phase 3: Forum → Kanban で作成したタスク数
 
 
-class ThreadMetaTracker:
+class ThreadMetaTracker(_JsonStore):
     """スレッドごとのメタデータ（last_message_id など）を永続化する。
 
     JSON 構造:
       {"<thread_id>": {"last_message_id": <int>}, ...}
     """
 
+    _DUMP_KWARGS = {"indent": 2, "sort_keys": True}
+
     def __init__(self, path: str = THREAD_META_PATH, slug: str = ""):
-        self._path = _slugged(path, slug)
-        self._lock = threading.RLock()
-        self._data: dict[str, dict] = {}
-        self._load()
-
-    def _load(self):
-        self._data = _load_json_dict(self._path)
-
-    def _save(self):
-        _atomic_save_json(self._path, self._data, indent=2, sort_keys=True)
+        super().__init__(path, slug)
 
     def _get_field(self, thread_id: int, field: str) -> int:
         with self._lock:
