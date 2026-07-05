@@ -60,96 +60,82 @@ class KanbanBridge:
         conn.execute("PRAGMA busy_timeout=120000")
         return conn
 
-    # ---- 読み取り ----
-
-    def get_all_tasks(self) -> list[dict]:
-        """全タスクを取得（初期同期用）"""
+    def _query(self, sql: str, params: tuple = ()) -> list[dict]:
         conn = self._connect()
         try:
-            rows = conn.execute(
-                "SELECT id, title, body, status, priority, assignee, "
-                "created_at, completed_at FROM tasks"
-            ).fetchall()
-            return [dict(r) for r in rows]
+            return [dict(r) for r in conn.execute(sql, params).fetchall()]
         finally:
             conn.close()
 
-    def get_tasks_changed_since_event(self, last_event_id: int) -> list[dict]:
-        """指定イベントID以降に変更があった全タスクを取得。
-        重複排除のため GROUP BY t.id で1タスク1行に厳密に制限。"""
+    def _query_one(self, sql: str, params: tuple = ()) -> Optional[dict]:
         conn = self._connect()
         try:
-            rows = conn.execute(
-                "SELECT t.id, t.title, t.body, t.status, "
-                "t.priority, t.assignee, t.created_at, t.completed_at "
-                "FROM tasks t "
-                "JOIN task_events e ON t.id = e.task_id "
-                "WHERE e.id > ? "
-                "GROUP BY t.id "
-                "ORDER BY MAX(e.id) ASC",
-                (last_event_id,),
-            ).fetchall()
-            return [dict(r) for r in rows]
-        finally:
-            conn.close()
-
-    def get_task(self, task_id: str) -> Optional[dict]:
-        """特定タスクを取得"""
-        conn = self._connect()
-        try:
-            row = conn.execute(
-                "SELECT id, title, body, status, priority, assignee, "
-                "created_at, completed_at FROM tasks WHERE id = ?",
-                (task_id,),
-            ).fetchone()
+            row = conn.execute(sql, params).fetchone()
             return dict(row) if row else None
         finally:
             conn.close()
 
+    # ---- 読み取り ----
+
+    def get_all_tasks(self) -> list[dict]:
+        """全タスクを取得（初期同期用）"""
+        return self._query(
+            "SELECT id, title, body, status, priority, assignee, "
+            "created_at, completed_at FROM tasks"
+        )
+
+    def get_tasks_changed_since_event(self, last_event_id: int) -> list[dict]:
+        """指定イベントID以降に変更があった全タスクを取得。
+        重複排除のため GROUP BY t.id で1タスク1行に厳密に制限。"""
+        return self._query(
+            "SELECT t.id, t.title, t.body, t.status, "
+            "t.priority, t.assignee, t.created_at, t.completed_at "
+            "FROM tasks t "
+            "JOIN task_events e ON t.id = e.task_id "
+            "WHERE e.id > ? "
+            "GROUP BY t.id "
+            "ORDER BY MAX(e.id) ASC",
+            (last_event_id,),
+        )
+
+    def get_task(self, task_id: str) -> Optional[dict]:
+        """特定タスクを取得"""
+        row = self._query_one(
+            "SELECT id, title, body, status, priority, assignee, "
+            "created_at, completed_at FROM tasks WHERE id = ?",
+            (task_id,),
+        )
+        return row
+
     def get_latest_event_id(self) -> int:
         """最新の task_events.id を取得（0の場合はテーブル空）"""
-        conn = self._connect()
-        try:
-            row = conn.execute("SELECT MAX(id) as max_id FROM task_events").fetchone()
-            return row["max_id"] or 0
-        finally:
-            conn.close()
+        row = self._query_one("SELECT MAX(id) as max_id FROM task_events")
+        return (row or {}).get("max_id") or 0
 
     def get_comments_since(self, task_id: str, last_id: int) -> list[dict]:
         """タスクのコメントを取得"""
-        conn = self._connect()
-        try:
-            rows = conn.execute(
-                "SELECT id, author, body, created_at FROM task_comments "
-                "WHERE task_id = ? AND id > ? ORDER BY id ASC",
-                (task_id, last_id),
-            ).fetchall()
-            return [dict(r) for r in rows]
-        finally:
-            conn.close()
+        return self._query(
+            "SELECT id, author, body, created_at FROM task_comments "
+            "WHERE task_id = ? AND id > ? ORDER BY id ASC",
+            (task_id, last_id),
+        )
 
     def get_events_since(self, task_id: str, last_id: int,
-                         kinds: list[str] = None) -> list[dict]:
+                         kinds: Optional[list[str]] = None) -> list[dict]:
         """タスクのイベントを取得（ワーカーログ用）"""
-        conn = self._connect()
-        try:
-            if kinds:
-                placeholders = ",".join("?" * len(kinds))
-                rows = conn.execute(
-                    f"SELECT id, kind, payload, created_at FROM task_events "
-                    f"WHERE task_id = ? AND id > ? AND kind IN ({placeholders}) "
-                    f"ORDER BY id ASC",
-                    (task_id, last_id, *kinds),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT id, kind, payload, created_at FROM task_events "
-                    "WHERE task_id = ? AND id > ? ORDER BY id ASC",
-                    (task_id, last_id),
-                ).fetchall()
-            return [dict(r) for r in rows]
-        finally:
-            conn.close()
+        if kinds:
+            placeholders = ",".join("?" * len(kinds))
+            return self._query(
+                f"SELECT id, kind, payload, created_at FROM task_events "
+                f"WHERE task_id = ? AND id > ? AND kind IN ({placeholders}) "
+                f"ORDER BY id ASC",
+                (task_id, last_id, *kinds),
+            )
+        return self._query(
+            "SELECT id, kind, payload, created_at FROM task_events "
+            "WHERE task_id = ? AND id > ? ORDER BY id ASC",
+            (task_id, last_id),
+        )
 
     # ---- ワーカー実行ログ（per-task テキストログ） ----
     #
