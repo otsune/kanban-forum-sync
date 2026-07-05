@@ -1,3 +1,4 @@
+import importlib.util
 import os
 import sys
 import unittest
@@ -13,6 +14,10 @@ def _bridge():
     return KanbanBridge(db_path="/tmp/kfs-default-assignee-test.db")
 
 
+HERMES_CLI_AVAILABLE = importlib.util.find_spec("hermes_cli") is not None
+
+
+@unittest.skipIf(not HERMES_CLI_AVAILABLE, "hermes_cli not installed in this environment")
 class ConfigDefaultAssigneeTest(unittest.TestCase):
     """_config_default_assignee(): load_config 経由・kanban 配下・キャッシュ。"""
 
