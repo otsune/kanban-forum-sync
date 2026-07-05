@@ -112,7 +112,7 @@ class DiscordForumClient:
             time.sleep(wait)
         self._last_request_ts = time.monotonic()
 
-    def _request(self, method: str, path: str, body: dict = None) -> dict:
+    def _request(self, method: str, path: str, body: Optional[dict] = None) -> dict:
         url = f"{BASE_URL}{path}"
         # Defense-in-depth: every request must target the Discord REST API over
         # https. `path` is built internally from snowflake IDs today, but this
@@ -315,7 +315,7 @@ class DiscordForumClient:
             "content": content,
         })
 
-    def get_thread_messages(self, thread_id: int, after: int = None,
+    def get_thread_messages(self, thread_id: int, after: Optional[int] = None,
                             limit: int = 50) -> list[dict]:
         """スレッドのメッセージ一覧を取得（フィードバック用 Phase 2）"""
         params = {"limit": min(limit, 100)}
