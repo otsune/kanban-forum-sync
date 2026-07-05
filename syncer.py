@@ -7,6 +7,7 @@ import os
 import re
 import time
 import logging
+from enum import Enum
 from threading import Thread, Event, RLock
 from typing import Optional
 
@@ -900,6 +901,27 @@ class KanbanForumSyncer:
 
     # ---- Phase 1 拡張: Kanban コメント・ワーカーログ → Forum ----
 
+    class _PostResult(Enum):
+        OK = "ok"
+        GONE = "gone"      # スレッド 404 → stale 掃除済み
+        FAILED = "failed"  # その他エラー（次サイクルで再試行）
+
+    def _post_to_thread(self, thread_id: int, text: str) -> "_PostResult":
+        """スレッドへ1メッセージ投稿する。404 は stale 掃除して GONE を返す。"""
+        try:
+            self.discord.send_message(thread_id, text[:_DISCORD_CONTENT_LIMIT])
+            time.sleep(0.5)
+            return self._PostResult.OK
+        except NotFoundError:
+            logger.warning(
+                "Thread %s not found while posting; removing stale mapping", thread_id
+            )
+            self._drop_stale_thread(thread_id)
+            return self._PostResult.GONE
+        except Exception as e:
+            logger.warning("Failed to post to thread %s: %s", thread_id, e)
+            return self._PostResult.FAILED
+
     def _sync_kanban_comments_to_forum(self):
         """task_comments とワーカーログ (blocked/spawned) を Discord スレッドに投稿する。"""
         sync_items = self._sync_map.items()
@@ -908,6 +930,8 @@ class KanbanForumSyncer:
 
         posted = 0
         for task_id, thread_id in sync_items.items():
+            gone = False
+
             # --- コメント ---
             last_comment_id = self._thread_meta.get_last_comment_id(thread_id)
             try:
@@ -917,19 +941,17 @@ class KanbanForumSyncer:
                 comments = []
 
             for c in comments:
-                try:
-                    text = f"💬 **{c['author']}**\n{c['body']}"
-                    self.discord.send_message(thread_id, text[:2000])
+                text = f"💬 **{c['author']}**\n{c['body']}"
+                result = self._post_to_thread(thread_id, text)
+                if result == self._PostResult.OK:
                     self._thread_meta.set_last_comment_id(thread_id, c["id"])
                     posted += 1
-                    time.sleep(0.5)
-                except NotFoundError:
-                    logger.warning("Thread %s not found while posting comment; removing stale mapping", thread_id)
-                    self._drop_stale_thread(thread_id)
+                else:
+                    if result == self._PostResult.GONE:
+                        gone = True
                     break
-                except Exception as e:
-                    logger.warning("Failed to post comment %s to thread %s: %s", c["id"], thread_id, e)
-                    break
+            if gone:
+                continue
 
             # --- ワーカーログ ---
             last_ev_id = self._thread_meta.get_last_kanban_event_id(thread_id)
@@ -940,23 +962,18 @@ class KanbanForumSyncer:
                 events = []
 
             for ev in events:
-                try:
-                    text = _format_worker_event(ev)
-                    if text:
-                        self.discord.send_message(thread_id, text[:2000])
+                text = _format_worker_event(ev)
+                if text:
+                    result = self._post_to_thread(thread_id, text)
+                    if result == self._PostResult.OK:
                         posted += 1
-                        time.sleep(0.5)
-                    self._thread_meta.set_last_kanban_event_id(thread_id, ev["id"])
-                except NotFoundError:
-                    logger.warning(
-                        "Thread %s not found while posting event %s; removing stale mapping",
-                        thread_id, ev["id"],
-                    )
-                    self._drop_stale_thread(thread_id)
-                    break
-                except Exception as e:
-                    logger.warning("Failed to post event %s to thread %s: %s", ev["id"], thread_id, e)
-                    break
+                    else:
+                        if result == self._PostResult.GONE:
+                            gone = True
+                        break
+                self._thread_meta.set_last_kanban_event_id(thread_id, ev["id"])
+            if gone:
+                continue
 
             # --- ワーカー実行ログ（per-task テキストログの Hermes 発話） ---
             # task_events には現れないワーカーの発話・思考を同期する。
@@ -968,27 +985,15 @@ class KanbanForumSyncer:
                 blocks = []
 
             sent_count = self._thread_meta.get_worker_log_count(thread_id)
-            if len(blocks) > sent_count:
-                for idx in range(sent_count, len(blocks)):
-                    body = blocks[idx]
-                    text = f"📝 **Worker log**\n{body}"
-                    try:
-                        self.discord.send_message(thread_id, text[:2000])
-                        posted += 1
-                        time.sleep(0.5)
-                        self._thread_meta.set_worker_log_count(thread_id, idx + 1)
-                    except NotFoundError:
-                        logger.warning(
-                            "Thread %s not found while posting worker log; removing stale mapping",
-                            thread_id,
-                        )
-                        self._drop_stale_thread(thread_id)
-                        break
-                    except Exception as e:
-                        logger.warning(
-                            "Failed to post worker log to thread %s: %s", thread_id, e
-                        )
-                        break
+            for idx in range(sent_count, len(blocks)):
+                body = blocks[idx]
+                text = f"📝 **Worker log**\n{body}"
+                result = self._post_to_thread(thread_id, text)
+                if result == self._PostResult.OK:
+                    posted += 1
+                    self._thread_meta.set_worker_log_count(thread_id, idx + 1)
+                else:
+                    break
 
         if posted:
             logger.info("Synced %d comment/log(s) to forum threads", posted)
