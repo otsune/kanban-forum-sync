@@ -41,15 +41,22 @@ class FakeDiscord:
 
 
 class FakeKanban:
-    def __init__(self, fail_on_body=None):
+    def __init__(self, fail_on_body=None, attach_outcomes=None):
         self.fail_on_body = fail_on_body
         self.comments = []
+        # url -> outcome (True / False / None), default True when absent
+        self.attach_outcomes = attach_outcomes or {}
+        self.attach_calls = []
 
     def add_comment(self, task_id, author, body):
         if body == self.fail_on_body:
             return False
         self.comments.append((task_id, author, body))
         return True
+
+    def attach_url(self, task_id, url, content_type=None, filename=None):
+        self.attach_calls.append((task_id, url, content_type, filename))
+        return self.attach_outcomes.get(url, True)
 
 
 class FakeTagKanban:
@@ -115,6 +122,14 @@ def make_message(message_id, content, bot=False):
         "content": content,
         "author": {"id": str(message_id), "username": f"user-{message_id}", "bot": bot},
     }
+
+
+def make_message_with_attachment(message_id, filename, url, size=0, content_type=None, content=""):
+    msg = make_message(message_id, content)
+    msg["attachments"] = [{
+        "filename": filename, "url": url, "size": size, "content_type": content_type,
+    }]
+    return msg
 
 
 class SyncSafetyTests(unittest.TestCase):
@@ -188,6 +203,65 @@ class SyncSafetyTests(unittest.TestCase):
 
         self.assertEqual(obj.discord.calls, [])
         self.assertEqual(kanban.comments, [])
+
+    def test_attachment_synced_via_attach_url_not_comment(self):
+        messages = [make_message_with_attachment(
+            101, "report.pdf", "https://cdn.example/report.pdf",
+            size=1024, content_type="application/pdf",
+        )]
+        kanban = FakeKanban()
+        obj = self.make_syncer(messages, kanban)
+
+        obj._sync_forum_comments()
+
+        self.assertEqual(
+            kanban.attach_calls,
+            [("task-1", "https://cdn.example/report.pdf", "application/pdf", "report.pdf")],
+        )
+        self.assertEqual(kanban.comments, [])
+        self.assertEqual(obj._thread_meta.get_last_message_id(123), 101)
+
+    def test_attachment_oversize_falls_back_to_comment(self):
+        oversize = syncer._MAX_ATTACHMENT_BYTES + 1
+        messages = [make_message_with_attachment(
+            101, "huge.zip", "https://cdn.example/huge.zip", size=oversize,
+        )]
+        kanban = FakeKanban()
+        obj = self.make_syncer(messages, kanban)
+
+        obj._sync_forum_comments()
+
+        self.assertEqual(kanban.attach_calls, [])
+        self.assertEqual(len(kanban.comments), 1)
+        self.assertIn("huge.zip", kanban.comments[0][2])
+        self.assertIn("https://cdn.example/huge.zip", kanban.comments[0][2])
+        self.assertEqual(obj._thread_meta.get_last_message_id(123), 101)
+
+    def test_attachment_permanent_failure_falls_back_to_comment_and_advances_cursor(self):
+        url = "https://cdn.example/rejected.bin"
+        messages = [make_message_with_attachment(101, "rejected.bin", url, size=10)]
+        kanban = FakeKanban(attach_outcomes={url: False})
+        obj = self.make_syncer(messages, kanban)
+
+        obj._sync_forum_comments()
+
+        self.assertEqual(len(kanban.attach_calls), 1)
+        self.assertEqual(len(kanban.comments), 1)
+        self.assertIn(url, kanban.comments[0][2])
+        self.assertEqual(obj._thread_meta.get_last_message_id(123), 101)
+
+    def test_attachment_transient_failure_halts_cursor_for_retry(self):
+        url = "https://cdn.example/flaky.bin"
+        messages = [make_message_with_attachment(101, "flaky.bin", url, size=10)]
+        kanban = FakeKanban(attach_outcomes={url: None})
+        obj = self.make_syncer(messages, kanban)
+
+        obj._sync_forum_comments()
+
+        self.assertEqual(len(kanban.attach_calls), 1)
+        self.assertEqual(kanban.comments, [])
+        # cursor did not advance past the failed message, so it retries next cycle
+        self.assertEqual(obj._thread_meta.get_last_message_id(123), 0)
 
     def test_tag_sync_uses_shared_thread_payload_instead_of_per_thread_get(self):
         obj = KanbanForumSyncer.__new__(KanbanForumSyncer)
@@ -266,6 +340,37 @@ class SyncSafetyTests(unittest.TestCase):
         self.assertEqual(ctx.calls[1][0], "kanban_create")
         self.assertEqual(ctx.calls[1][1]["title"], "Forum title")
         self.assertEqual(ctx.calls[1][1]["assignee"], "router")
+
+    def test_attach_url_dispatches_kanban_attach_url_with_filename(self):
+        ctx = FakeCtx()
+        bridge = KanbanBridge(ctx=ctx)
+
+        result = bridge.attach_url(
+            "t1", "https://cdn.example/x.png", content_type="image/png", filename="x.png",
+        )
+
+        self.assertTrue(result)
+        self.assertEqual(ctx.calls[0][0], "kanban_attach_url")
+        self.assertEqual(ctx.calls[0][1], {
+            "task_id": "t1", "url": "https://cdn.example/x.png",
+            "content_type": "image/png", "filename": "x.png",
+        })
+
+    def test_attach_url_returns_false_on_permanent_tool_error(self):
+        class ErrorCtx:
+            def dispatch_tool(self, tool_name, args):
+                return '{"error": "url rejected"}'
+
+        bridge = KanbanBridge(ctx=ErrorCtx())
+        self.assertFalse(bridge.attach_url("t1", "https://cdn.example/bad.bin"))
+
+    def test_attach_url_returns_none_on_transient_dispatch_failure(self):
+        class RaisingCtx:
+            def dispatch_tool(self, tool_name, args):
+                raise RuntimeError("network blip")
+
+        bridge = KanbanBridge(ctx=RaisingCtx())
+        self.assertIsNone(bridge.attach_url("t1", "https://cdn.example/x.bin"))
 
     def test_status_writes_use_semantic_kanban_tools_only(self):
         ctx = FakeCtx()

@@ -39,6 +39,13 @@ from .i18n import (  # noqa: F401 — 再エクスポート（テスト・外部
 _DISCORD_CONTENT_LIMIT = 2000
 _TRUNCATION_SUFFIX = "\n…(truncated)"
 
+# kanban_attach_url のサーバー側取込上限。core の共有定数を使い、
+# import できない古い hermes-agent ではローカル既定値にフォールバックする。
+try:
+    from hermes_cli.kanban_db import KANBAN_ATTACHMENT_MAX_BYTES as _MAX_ATTACHMENT_BYTES
+except Exception:
+    _MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024  # 25 MB
+
 # task_events の種別のうち Discord に通知するもの
 _WORKER_LOG_KINDS = [
     "blocked", "unblocked",
@@ -380,36 +387,56 @@ class KanbanForumSyncer:
         return self._bot_user_id
 
     def _sync_attachment(self, task_id: str, author_name: str, att: dict) -> bool:
-        """Discord メッセージの添付ファイル1件を Kanban に同期する。
+        """Discord メッセージの添付ファイル1件を Kanban の attachment に同期する。
 
-        【暫定実装】Discord のファイル URL を kanban_comment として投稿する。
+        kanban_attach_url にサーバー側で URL を取得させ、real な
+        task_attachments 行として取り込む（SSRF ガード・25MB 上限は
+        hermes-agent 側の tools/url_safety.py + KANBAN_ATTACHMENT_MAX_BYTES に
+        準拠。上流 PR https://github.com/NousResearch/hermes-agent/pull/36019
+        が #65698 経由でマージ済み — 経緯は
+        docs/plans/ATTACHMENT_TOOLSET_PR_PLAN.md 参照）。
 
-        本来は task_attachments に「Upload file」として取り込みたいが、現状の
-        Hermes には添付用の toolset ツールも CLI コマンドも存在しない
-        （登録ツールは show/list/complete/block/heartbeat/comment/create/
-          unblock/link のみ。書き込みは kanban_db.add_attachment の直接DB
-          操作しかなく、本プラグインの DB アクセス方針に反する）。
-        そのため当面は唯一の実在ツール kanban_comment で URL リンクを残す。
-        添付 toolset/CLI を Hermes 本体に追加する PR を申請済み:
-        https://github.com/NousResearch/hermes-agent/pull/36019
-        これがマージされ installed hermes-agent に入り次第、kanban_attach_url
-        経由の本物の取り込みに差し替える。切替手順は docs/plans/ATTACHMENT_TOOLSET_PR_PLAN.md
-        の "Upstream PR status" 節を参照。
+        - サイズが上限を超える添付は取り込まず、Discord URL をコメントとして
+          残す（ツールに投げても拒否されるだけでカーソルが進まなくなるため、
+          事前にスキップする）。
+        - kanban_attach_url が恒久的に失敗した場合（拒否された URL、期限切れ
+          CDN URL の 404 など）も同様に URL コメントへフォールバックする。
+        - dispatch 自体が一時的に失敗した場合のみ False を返し、カーソルを
+          進めず次サイクルで再試行する。
 
-        成功で True、一時的失敗で False（カーソルを進めず次サイクルで再試行）。
+        成功（取込 or フォールバック済み）で True、一時的失敗で False。
         """
         filename = att.get("filename", "file")
         url = att.get("url", "")
+        content_type = att.get("content_type")
         size = att.get("size", 0)
 
         if not url:
             logger.warning("Attachment '%s' has no url; skipping", filename)
             return True  # 取りようがないのでカーソルは進める
 
-        size_note = f"（{size} bytes）" if size else ""
+        if size and size > _MAX_ATTACHMENT_BYTES:
+            logger.info(
+                "Attachment '%s' (%d bytes) exceeds %d limit; posting url as comment",
+                filename, size, _MAX_ATTACHMENT_BYTES,
+            )
+            return self.kanban.add_comment(
+                task_id, author_name,
+                f"📎 添付ファイル（サイズ上限超過のため未取込）: {filename}\n{url}",
+            )
+
+        outcome = self.kanban.attach_url(
+            task_id, url, content_type=content_type, filename=filename,
+        )
+        if outcome is True:
+            return True
+        if outcome is None:
+            return False  # 一時的失敗: カーソルを進めず次サイクルで再試行
+
+        # 恒久的失敗: フォールバックしてカーソルは進める
         return self.kanban.add_comment(
             task_id, author_name,
-            f"📎 Discord 添付ファイル{size_note}: {filename}\n{url}",
+            f"📎 添付ファイル（取込失敗のためリンクのみ）: {filename}\n{url}",
         )
 
     def _sync_forum_comments(self, threads_by_id: Optional[dict[int, dict]] = None):

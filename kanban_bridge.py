@@ -186,24 +186,39 @@ class KanbanBridge:
 
     # ---- 書き込み（Kanban toolset 経由） ----
 
-    def _dispatch_kanban_tool(self, tool_name: str, args: dict) -> Optional[dict]:
+    def _dispatch_kanban_tool_ex(
+        self, tool_name: str, args: dict
+    ) -> tuple[Optional[dict], bool]:
+        """``(result, permanent)`` を返す。
+
+        ``permanent=True`` は「ツールが実行され、明示的にエラーを返した」場合
+        （例: URL 拒否、ファイル未検出、サイズ超過など）— リトライしても
+        同じ結果になるため、呼び出し側はフォールバックしてカーソルを進めてよい。
+        ``permanent=False`` は「dispatch 自体が例外/未接続で失敗した」場合
+        （ネットワーク瞬断など一時的の可能性がある）— カーソルを進めず
+        次サイクルで再試行すべき。成功時は ``(result, False)``。
+        """
         if self.ctx is None:
             logger.error("%s requires plugin ctx.dispatch_tool; write skipped", tool_name)
-            return None
+            return None, False
 
         try:
             raw = self.ctx.dispatch_tool(tool_name, args)
             result = json.loads(raw) if isinstance(raw, str) else raw
         except Exception as e:
             logger.error("%s dispatch failed: %s", tool_name, e)
-            return None
+            return None, False
 
         if not isinstance(result, dict):
             logger.error("%s returned non-object result: %r", tool_name, result)
-            return None
+            return None, False
         if result.get("error"):
             logger.error("%s failed: %s", tool_name, result["error"])
-            return None
+            return None, True
+        return result, False
+
+    def _dispatch_kanban_tool(self, tool_name: str, args: dict) -> Optional[dict]:
+        result, _permanent = self._dispatch_kanban_tool_ex(tool_name, args)
         return result
 
     def _config_default_assignee(self) -> Optional[str]:
@@ -332,6 +347,34 @@ class KanbanBridge:
             logger.info("Added comment to task-%s by %s", task_id, author)
             return True
         return False
+
+    def attach_url(self, task_id: str, url: str,
+                   content_type: Optional[str] = None,
+                   filename: Optional[str] = None) -> Optional[bool]:
+        """添付ファイルを URL 経由で追加する（``kanban_attach_url`` ツール経由）。
+
+        Hermes 側が ``url`` をサーバー側でフェッチして ``task_attachments`` に
+        保存する（``tools/url_safety.py`` 経由の SSRF ガード、25MB 上限）。
+        Discord CDN の署名付き URL は即時取得なら有効。
+
+        戻り値は3値:
+        - ``True``  — 取込成功
+        - ``False`` — 恒久的失敗（ツールが明示的にエラーを返した。例: URL 拒否
+          [SSRF ガード]、期限切れ CDN URL の 404、サイズ超過）。呼び出し側は
+          フォールバック（例: URL をコメント投稿）してカーソルを進めてよい
+        - ``None``  — 一時的失敗（dispatch 自体が失敗）。カーソルを進めず
+          次サイクルで再試行すべき
+        """
+        args: dict = {"task_id": task_id, "url": url}
+        if content_type:
+            args["content_type"] = content_type
+        if filename:
+            args["filename"] = filename
+        result, permanent = self._dispatch_kanban_tool_ex("kanban_attach_url", args)
+        if result:
+            logger.info("Attached url '%s' to task-%s", filename or url, task_id)
+            return True
+        return False if permanent else None
 
     def record_event(self, task_id: str, kind: str,
                      payload: Optional[str] = None) -> bool:

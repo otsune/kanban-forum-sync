@@ -92,33 +92,36 @@ Then the dashboard endpoint, the new tools, and the new CLI commands all call th
 
 This plan has been filed upstream as **[NousResearch/hermes-agent#36019](https://github.com/NousResearch/hermes-agent/pull/36019)** — *"feat(kanban): task attachment toolset + CLI + agent file delivery"*.
 
-**Status (last checked 2026-06-01): OPEN, mergeable, not yet merged.**
+**Status (checked 2026-07-22): CLOSED — merged via rebase-merge in [#65698](https://github.com/NousResearch/hermes-agent/pull/65698) (2026-07-16, head commit `b5bd0ef38`), authorship preserved via cherry-pick.** Two review blockers from `teknium1` were fixed on top before merge:
+1. `kanban_attach_url` now routes its fetch through `tools/url_safety.py` (loopback/private-range/cloud-metadata/redirect-hop rejection).
+2. The size cap was unified onto the already-centralized `KANBAN_ATTACHMENT_MAX_BYTES` constant in `hermes_cli/kanban_db.py` (25 MB) instead of the PR's original private constant.
 
-Re-check before changing the interim implementation:
+Confirmed present in the installed `hermes-agent` (`~/.hermes/hermes-agent` @ `67e73ae95`): `kanban_attach` / `kanban_attach_url` / `kanban_attachments` are registered in `tools/kanban_tools.py`'s `kanban` toolset.
 
-```bash
-gh pr view 36019 --repo NousResearch/hermes-agent --json state,mergedAt,title
-```
+**Migration completed (2026-07-22):** `KanbanBridge.attach_url()` re-added (using the merged schema's `filename` arg, not the original PR's `title`) and `_sync_attachment()` in `syncer.py` now calls it for real attachment ingestion, falling back to a `kanban_comment` URL link only for oversize files or a permanent tool-level rejection. See `CLAUDE.md`'s Phase 2 Attachments bullet for the current behavior description.
 
-The actual tool surface the PR adds (use these exact names/args when migrating):
+The actual merged tool surface (confirmed in `tools/kanban_tools.py` on the installed hermes-agent — note this differs slightly from the plan's original sketch above, which listed a `kanban_list_attachments`/`kanban_download_attachment`/`kanban_delete_attachment` split that was not what shipped):
 
 | Tool | Args | Notes |
 |---|---|---|
-| `kanban_attach` | `task_id`, `filename`, `content_base64`, `content_type?` | inline upload, 25 MB cap |
-| `kanban_attach_url` | `task_id`, `url`, `content_type?`, `filename?` | server-side fetch-by-URL, 25 MB cap |
-| `kanban_list_attachments` | `task_id` | list metadata |
-| `kanban_download_attachment` | `attachment_id` | bytes as base64 |
-| `kanban_delete_attachment` | `attachment_id` | row + blob |
+| `kanban_attach` | `task_id?`, `filename`, `content_base64`, `content_type?`, `board?` | inline upload, 25 MB cap |
+| `kanban_attach_url` | `task_id?`, `url`, `filename?`, `content_type?`, `board?` | server-side fetch-by-URL via `tools/url_safety.py`, 25 MB cap |
+| `kanban_attachments` | `task_id?`, `board?` | list metadata + on-disk path (read-only) |
 
-### Migration, conditional on PR #36019 state
+CLI (`hermes_cli/kanban.py`): `hermes kanban attach <task_id> <path>`, `hermes kanban attachments <task_id>`, `hermes kanban attach-rm <attachment_id>`.
 
-- **While OPEN / closed-unmerged** → keep the current interim implementation: `_sync_attachment()` posts the Discord file URL via `kanban_comment`. Do **not** call `kanban_attach*` — those tools don't exist in the installed hermes-agent yet and dispatch will fail (→ cursor stalls → infinite retry). This already bit us once (commit 36ccb63).
+### Migration — completed 2026-07-22
 
-- **Once MERGED and present in the installed hermes-agent** (verify the tool is actually registered, not just merged on `main` — the local install may lag; check with `HERMES_KANBAN_TASK=1` or grep `tools/kanban_tools.py` for `name="kanban_attach_url"`):
-  1. Re-add `KanbanBridge.attach_url(task_id, url, content_type=None, filename=None)` → `self._dispatch_kanban_tool("kanban_attach_url", {...})`.
-  2. Swap `_sync_attachment()` in `syncer.py` from the `kanban_comment` fallback to `self.kanban.attach_url(task_id, url, content_type=att.get("content_type"), filename=filename)`. Pass the Discord CDN `url`; the server fetches it within the same sync cycle while the signed URL is still valid.
-  3. Keep a 25 MB pre-check on `att["size"]`: oversize files → still post the URL as a `kanban_comment` (don't let a permanently-too-large file stall the cursor in an infinite retry).
-  4. Update the **Attachments** bullet in `CLAUDE.md` (currently marked "interim") and the `_sync_attachment` docstring to describe the real upload path.
-  5. Verify end-to-end: post a small image to a synced Discord thread → confirm a `task_attachments` row + on-disk blob appear (`kanban_list_attachments` or the dashboard), not just a comment.
+The plugin now uses the real surface. What changed vs. the original sketch:
+
+1. `KanbanBridge.attach_url(task_id, url, content_type=None, filename=None)` re-added → dispatches `kanban_attach_url` with `filename` (not `title` — the merged schema uses `filename`). Returns a 3-way result: `True` (stored), `False` (permanent tool-level rejection — bad/expired URL, oversize, etc.), `None` (transient dispatch failure). This distinction is new versus the original `36ccb63` implementation, which only returned `bool` and could stall the cursor forever on a permanent rejection.
+2. `_sync_attachment()` in `syncer.py` calls `self.kanban.attach_url(task_id, url, content_type=att.get("content_type"), filename=filename)`.
+   - Oversize (`att["size"] > KANBAN_ATTACHMENT_MAX_BYTES`, imported from `hermes_cli.kanban_db` with a local fallback) → still posts the URL as a `kanban_comment`, skipping the tool call entirely.
+   - `attach_url()` returns `False` (permanent) → falls back to a `kanban_comment` URL link so the cursor still advances.
+   - `attach_url()` returns `None` (transient) → returns `False` from `_sync_attachment`, leaving the cursor in place for retry next cycle.
+3. `CLAUDE.md`'s Phase 2 **Attachments** bullet and this file were updated to describe the real upload path.
+4. Tests added in `tests/test_sync_safety.py`: `attach_url` dispatch (success/permanent/transient), and `_sync_attachment` end-to-end (normal, oversize, permanent-failure, transient-failure).
+
+**Still to verify manually** (not covered by unit tests — requires a live Discord thread + gateway restart to pick up the new code): post a small image to a synced Discord thread → confirm a `task_attachments` row + on-disk blob appear via `hermes kanban attachments <task_id>`, not just a comment link.
 
 The `_sync_attachment` docstring in `syncer.py` points back to this file, so this section is the single source of truth for the swap.
